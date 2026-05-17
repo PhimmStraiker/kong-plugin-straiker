@@ -158,7 +158,10 @@ create_plugin(route_agentic["id"], "straiker", {
     "detect_url": "https://api.prod.straiker.ai/api/v1/detect",
     "source": "kong-ai-proxy-advanced",
     "destination": "api.openai.com",
-    "mode": "both",
+    # post_call so agent loops complete; pre-call blocking is exercised separately on the
+    # blocking-demo route below. Tenant has LLM Evasion in block mode, which over-fires on
+    # nearly all agent traffic and prevents real multi-step flows from completing.
+    "mode": "post_call",
     "agentic": True,
     "threshold": 0.5,
     "timeout": 5000,

@@ -1,5 +1,6 @@
 local http = require "resty.http"
 local cjson = require "cjson.safe"
+local kong_gzip = require "kong.tools.gzip"
 
 -- PRIORITY 760 puts us after Kong's ai-proxy / ai-proxy-advanced (PRIORITY 770)
 -- in body_filter, so we read the upstream response *after* ai-proxy-advanced
@@ -238,6 +239,19 @@ function StraikerHandler:access(conf)
 
   ngx.req.read_body()
   local raw = ngx.req.get_body_data()
+  if not raw then
+    -- Kong buffered the body to a tempfile because it exceeded
+    -- client_body_buffer_size (default 8 KiB). Common with agent-loop
+    -- iterations where messages[] accumulates tool results. Pull it back.
+    local body_file = ngx.req.get_body_file()
+    if body_file then
+      local f = io.open(body_file, "rb")
+      if f then
+        raw = f:read("*a")
+        f:close()
+      end
+    end
+  end
   if not raw or raw == "" then return end
 
   local body = cjson.decode(raw)
@@ -327,13 +341,16 @@ function StraikerHandler:header_filter(conf)
   if conf.mode == "pre_call" then return end
   -- swallow Content-Length so the buffered body can be re-emitted unchanged
   ngx.header.content_length = nil
-  -- Remember the response Content-Type so body_filter knows whether to parse
-  -- the buffer as a single chat.completion JSON or as an SSE stream of
-  -- chat.completion.chunk events. ai-proxy-advanced re-emits its own SSE
-  -- frames when the route is configured for streaming, so detection here is
-  -- the reliable signal.
+  -- Remember the response Content-Type / Encoding so body_filter knows whether
+  -- to parse the buffer as a single chat.completion JSON, an SSE stream, and
+  -- whether the buffer is gzipped. ai-proxy-advanced does not honor our
+  -- access-phase Accept-Encoding: identity override and forwards OpenAI's
+  -- gzipped bytes unchanged when the upstream chose gzip — so we must inflate
+  -- before parsing.
   local ct = ngx.header.content_type or ""
   kong.ctx.plugin.is_sse = ct:find("text/event-stream", 1, true) ~= nil
+  local ce = ngx.header.content_encoding or ""
+  kong.ctx.plugin.is_gzip = ce:lower():find("gzip", 1, true) ~= nil
 end
 
 -- Parse a buffered SSE response from ai-proxy-advanced (or any
@@ -398,6 +415,20 @@ function StraikerHandler:body_filter(conf)
 
   if not eof then return end
 
+  -- Inflate gzipped responses before parsing. Detected via header_filter.
+  -- Defensive check on magic bytes too for cases where the header was missing.
+  local raw_body = kong.ctx.plugin.body_buf
+  local looks_gzip = #raw_body >= 2 and raw_body:byte(1) == 0x1f and raw_body:byte(2) == 0x8b
+  if kong.ctx.plugin.is_gzip or looks_gzip then
+    local ok, inflated = pcall(kong_gzip.inflate_gzip, raw_body)
+    if ok and inflated and #inflated > 0 then
+      raw_body = inflated
+    else
+      ngx.log(ngx.WARN, "[straiker] gzip inflate failed, falling back to raw body")
+    end
+  end
+  kong.ctx.plugin.body_buf = raw_body
+
   local app_response = ""
   local has_tool_calls = false
 
@@ -413,8 +444,20 @@ function StraikerHandler:body_filter(conf)
     -- Single-shot JSON path (v0.3.x behavior).
     local resp = cjson.decode(kong.ctx.plugin.body_buf)
     if resp and resp.choices and resp.choices[1] and resp.choices[1].message then
-      app_response = resp.choices[1].message.content or ""
-      has_tool_calls = resp.choices[1].message.tool_calls ~= nil
+      local msg = resp.choices[1].message
+      -- cjson.safe decodes JSON `null` to a non-nil sentinel (cjson.null). Treat
+      -- it as missing both for content (otherwise the literal "userdata: NULL"
+      -- would leak into app_response) and for tool_calls (otherwise we'd flag
+      -- final-iteration responses with tool_calls:null as "still calling tools"
+      -- and skip post-call — silently dropping every agent-loop final turn).
+      local content = msg.content
+      if content == nil or content == cjson.null or type(content) ~= "string" then
+        app_response = ""
+      else
+        app_response = content
+      end
+      local tcs = msg.tool_calls
+      has_tool_calls = type(tcs) == "table" and #tcs > 0
     end
   end
 

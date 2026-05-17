@@ -396,10 +396,15 @@ local function parse_sse_buffer(buf)
   local tool_calls = nil
   if saw_tool_calls then
     tool_calls = {}
-    local i = 1
-    while tool_call_acc[i] do
-      table.insert(tool_calls, tool_call_acc[i])
-      i = i + 1
+    -- Collect indices and sort: OpenAI typically emits contiguous indices
+    -- starting at 0, but be defensive against gaps or non-zero start.
+    local indices = {}
+    for idx in pairs(tool_call_acc) do
+      indices[#indices + 1] = idx
+    end
+    table.sort(indices)
+    for _, idx in ipairs(indices) do
+      tool_calls[#tool_calls + 1] = tool_call_acc[idx]
     end
   end
   return table.concat(content_parts), tool_calls
@@ -411,13 +416,25 @@ function StraikerHandler:body_filter(conf)
 
   local chunk = ngx.arg[1]
   local eof = ngx.arg[2]
-  kong.ctx.plugin.body_buf = (kong.ctx.plugin.body_buf or "") .. (chunk or "")
+  -- Accumulate chunks in a table and concat at EOF (O(n)). Repeated string
+  -- concatenation in Lua is O(n^2) and noticeable on multi-MB streams.
+  local parts = kong.ctx.plugin.body_parts
+  if not parts then
+    parts = {}
+    kong.ctx.plugin.body_parts = parts
+  end
+  if chunk and chunk ~= "" then
+    parts[#parts + 1] = chunk
+  end
 
   if not eof then return end
 
+  local raw_body = table.concat(parts)
+  -- Free the per-chunk table now that we have the assembled body.
+  kong.ctx.plugin.body_parts = nil
+
   -- Inflate gzipped responses before parsing. Detected via header_filter.
   -- Defensive check on magic bytes too for cases where the header was missing.
-  local raw_body = kong.ctx.plugin.body_buf
   local looks_gzip = #raw_body >= 2 and raw_body:byte(1) == 0x1f and raw_body:byte(2) == 0x8b
   if kong.ctx.plugin.is_gzip or looks_gzip then
     local ok, inflated = pcall(kong_gzip.inflate_gzip, raw_body)

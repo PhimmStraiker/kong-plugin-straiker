@@ -107,16 +107,43 @@ local function build_agentic_messages(req_messages, app_response)
   return out
 end
 
+-- Decode JWT payload from kong.ctx.shared.authenticated_jwt_token (set by
+-- Kong's jwt or openid-connect plugin) or the Authorization: Bearer header.
+-- Returns a claims table or nil.
+local function decode_jwt_claims(headers)
+  local raw_token = kong.ctx.shared and kong.ctx.shared.authenticated_jwt_token
+  if raw_token then
+    kong.log.debug("[straiker] authenticated_jwt_token found in kong.ctx.shared")
+  else
+    local auth = headers and (headers["authorization"] or headers["Authorization"])
+    if auth then raw_token = auth:match("^[Bb]earer%s+(.+)$") end
+  end
+  if not raw_token then return nil end
+
+  local payload_b64 = raw_token:match("^[^%.]+%.([^%.]+)%.")
+  if not payload_b64 then return nil end
+
+  local padded = payload_b64:gsub("%-", "+"):gsub("_", "/")
+  padded = padded .. string.rep("=", (4 - (#padded % 4)) % 4)
+  local json_str = ngx.decode_base64(padded)
+  if not json_str then return nil end
+
+  local ok, claims = pcall(cjson.decode, json_str)
+  if ok and type(claims) == "table" then return claims end
+  return nil
+end
+
 local function resolve_user_name(headers, body)
-  -- Identity fallback chain, in order of trust:
-  --   1. Explicit Straiker header set by upstream identity gateway
-  --   2. Kong consumer (set by kong key-auth/jwt/oauth plugins)
-  --   3. OpenAI standard `user` field in the request body
-  --   4. fallback
+  -- Trust order: explicit header → JWT claim → OpenAI `user` field → fallback.
   if headers["x-user-name"] then return headers["x-user-name"] end
-  local ok, consumer = pcall(function() return kong.client.get_consumer() end)
-  if ok and consumer and (consumer.username or consumer.custom_id) then
-    return consumer.username or consumer.custom_id
+  local claims = decode_jwt_claims(headers)
+  if claims then
+    local user = claims.email or claims.preferred_username
+                 or claims["cognito:username"] or claims.sub
+    if type(user) == "string" and user ~= "" then
+      kong.log.debug("[straiker] user from JWT: ", user)
+      return user
+    end
   end
   if body and type(body.user) == "string" and body.user ~= "" then
     return body.user
@@ -137,34 +164,12 @@ local function client_metadata(headers, body)
   }
 end
 
--- resolve_app_source: three-tier lookup for the per-request app identifier.
---
--- Tier 1 — app_id_header:
---   Read a pre-injected request header (e.g. "x-app-id"). Use when something
---   upstream of this plugin places the app id in a header: a request-transformer,
---   an API-gateway edge, or the calling app itself. (Note: Kong openid-connect's
---   claim-to-header injection maps id_token / userinfo claims, not bearer
---   access-token claims, so it does NOT populate this for app-only Entra tokens
---   — Tier 2 is the path for that case.)
---
--- Tier 2 — jwt_app_claim via kong.ctx.shared.authenticated_jwt_token:
---   The Kong auth plugin that validated the request leaves the verified raw JWT
---   here. Both the Enterprise openid-connect plugin (validates Entra tokens
---   against the tenant JWKS) and the free jwt plugin populate this field.
---   We base64url-decode the payload and extract the named claim. This is the
---   production path for Microsoft Entra / Azure AD: it is signature-verified by
---   Kong and survives ai-proxy-advanced replacing the Authorization header,
---   because it is request context rather than a header. EMPIRICALLY VERIFIED
---   against a real Entra tenant with openid-connect + ai-proxy-advanced.
---
--- Tier 3 — jwt_app_claim via Authorization header (fallback):
---   Read Authorization: Bearer <token> directly and decode the payload.
---   Works when no validating auth plugin is in the chain (local/dev setups).
---   Will NOT see the token on ai-proxy-advanced routes (the proxy replaces the
---   Authorization header before this plugin's access phase) — use Tier 2 there.
---
+-- resolve_app_source: per-request app identifier.
+--   Tier 1 — app_id_header: read a pre-injected request header.
+--   Tier 2 — Kong consumer: username or custom_id set by an auth plugin
+--            (key-auth, basic-auth, openid-connect, etc.).
+--   Fallback — conf.source or "Kong Default App".
 local function resolve_app_source(conf, headers)
-  -- Tier 1: pre-injected header (OIDC upstream_headers pattern).
   if conf.app_id_header and conf.app_id_header ~= "" and conf.app_id_header ~= "off" then
     local hval = headers and (headers[conf.app_id_header] or headers[conf.app_id_header:lower()])
     if type(hval) == "string" and hval ~= "" then
@@ -172,41 +177,12 @@ local function resolve_app_source(conf, headers)
     end
   end
 
-  -- Tiers 2+3 require jwt_app_claim to be enabled.
-  if not conf.jwt_app_claim or conf.jwt_app_claim == "" or conf.jwt_app_claim == "off" then
-    return nil
+  local ok, consumer = pcall(function() return kong.client.get_consumer() end)
+  if ok and consumer and (consumer.username or consumer.custom_id) then
+    return consumer.username or consumer.custom_id
   end
 
-  -- Get raw JWT — prefer kong.ctx.shared (set by Kong's free jwt plugin),
-  -- fall back to reading the Authorization header directly.
-  local raw_token = kong.ctx.shared and kong.ctx.shared.authenticated_jwt_token
-  if not raw_token then
-    local auth = headers and (headers["authorization"] or headers["Authorization"])
-    if auth then raw_token = auth:match("^[Bb]earer%s+(.+)$") end
-  end
-  if not raw_token then return nil end
-
-  -- JWT = <header>.<payload>.<signature> — extract the middle segment.
-  local payload_b64 = raw_token:match("^[^%.]+%.([^%.]+)%.")
-  if not payload_b64 then return nil end
-
-  -- base64url → standard base64 (- → +, _ → /) then re-pad and decode.
-  local padded = payload_b64:gsub("%-", "+"):gsub("_", "/")
-  padded = padded .. string.rep("=", (4 - (#padded % 4)) % 4)
-  local json_str = ngx.decode_base64(padded)
-  if not json_str then return nil end
-
-  local ok, claims = pcall(cjson.decode, json_str)
-  if not ok or type(claims) ~= "table" then return nil end
-
-  -- "auto": prefer human-readable display name → azp (Entra v2) → appid (Entra v1).
-  -- app_displayname is an optional Entra claim; azp/appid are always present.
-  if conf.jwt_app_claim == "auto" then
-    local val = claims.app_displayname or claims.azp or claims.appid
-    return type(val) == "string" and val ~= "" and val or nil
-  end
-  local val = claims[conf.jwt_app_claim]
-  return type(val) == "string" and val ~= "" and val or nil
+  return nil
 end
 
 local function build_payload(opts)
@@ -214,10 +190,7 @@ local function build_payload(opts)
   local meta = client_metadata(opts.headers, opts.body)
   local trace_id   = opts.headers["x-trace-id"]
   local agent_role = opts.headers["x-agent-role"]
-  -- dynamic_source overrides conf.source when a JWT claim was successfully
-  -- extracted (e.g. Entra azp/appid) — enables auto-enumeration of multiple
-  -- apps sharing a single Straiker key on one Kong gateway.
-  local effective_source = opts.dynamic_source or opts.conf.source
+  local effective_source = opts.dynamic_source or opts.conf.source or "Kong Default App"
   -- /detect?agentic schema: identity travels in a metadata{} envelope. Field
   -- names match the /detect payload the Straiker API expects (user_name,
   -- session_id, user_role, remote_ip). trace_id and agent_role ride along so
@@ -293,6 +266,7 @@ local function call_straiker(conf, payload)
     headers = {
       ["Authorization"] = "Bearer " .. conf.api_key,
       ["Content-Type"] = "application/json",
+      ["X-Straiker-Smart-Publish"] = "true",
     },
     ssl_verify = true,
     keepalive_timeout = 60000,
@@ -370,7 +344,7 @@ local function emit_mcp_discovery(conf, raw)
   local server_name, mcp_url = mcp_server_identity(conf)
   local source = (conf.mcp_source and conf.mcp_source ~= "" and conf.mcp_source ~= "off")
                  and conf.mcp_source or "kong"
-  local app = kong.ctx.plugin.dynamic_source or conf.source or "kong-gateway"
+  local app = kong.ctx.plugin.dynamic_source or conf.source or "Kong Default App"
   local detect = (conf.detect_url or "https://api.prod.straiker.ai/api/v1/detect"):gsub("%?.*$", "")
   local api_key = conf.api_key
 
@@ -401,6 +375,7 @@ local function emit_mcp_discovery(conf, raw)
               ["Content-Type"]  = "application/json",
               ["Authorization"] = "Bearer " .. api_key,
               ["x-tool"]        = source,
+              ["X-Straiker-Smart-Publish"] = "true",
             },
           })
           if not res then

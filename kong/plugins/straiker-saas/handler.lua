@@ -166,12 +166,43 @@ local function build_agentic_messages(req_messages, app_response, final_tool_cal
   return out
 end
 
+-- Decode JWT payload from kong.ctx.shared.authenticated_jwt_token (set by
+-- Kong's jwt or openid-connect plugin) or the Authorization: Bearer header.
+-- Returns a claims table or nil.
+local function decode_jwt_claims(headers)
+  local raw_token = kong.ctx.shared and kong.ctx.shared.authenticated_jwt_token
+  if raw_token then
+    kong.log.debug("[straiker-saas] authenticated_jwt_token found in kong.ctx.shared")
+  else
+    local auth = headers and (headers["authorization"] or headers["Authorization"])
+    if auth then raw_token = auth:match("^[Bb]earer%s+(.+)$") end
+  end
+  if not raw_token then return nil end
+
+  local payload_b64 = raw_token:match("^[^%.]+%.([^%.]+)%.")
+  if not payload_b64 then return nil end
+
+  local padded = payload_b64:gsub("%-", "+"):gsub("_", "/")
+  padded = padded .. string.rep("=", (4 - (#padded % 4)) % 4)
+  local json_str = ngx.decode_base64(padded)
+  if not json_str then return nil end
+
+  local ok, claims = pcall(cjson.decode, json_str)
+  if ok and type(claims) == "table" then return claims end
+  return nil
+end
+
 local function resolve_user_name(headers, body)
-  -- Trust order: explicit Straiker header → Kong consumer → OpenAI `user` → fallback.
+  -- Trust order: explicit header → JWT claim → OpenAI `user` field → fallback.
   if headers["x-user-name"] then return headers["x-user-name"] end
-  local ok, consumer = pcall(function() return kong.client.get_consumer() end)
-  if ok and consumer and (consumer.username or consumer.custom_id) then
-    return consumer.username or consumer.custom_id
+  local claims = decode_jwt_claims(headers)
+  if claims then
+    local user = claims.email or claims.preferred_username
+                 or claims["cognito:username"] or claims.sub
+    if type(user) == "string" and user ~= "" then
+      kong.log.debug("[straiker-saas] user from JWT: ", user)
+      return user
+    end
   end
   if body and type(body.user) == "string" and body.user ~= "" then
     return body.user
@@ -192,16 +223,12 @@ local function client_metadata(headers, body)
   }
 end
 
--- resolve_app_source: three-tier per-request app identifier (Entra/Azure AD).
+-- resolve_app_source: per-request app identifier.
 -- Identical to the `straiker` build.
 --   Tier 1 — app_id_header: read a pre-injected request header.
---   Tier 2 — jwt_app_claim via kong.ctx.shared.authenticated_jwt_token: the
---            verified JWT left by openid-connect (Entra, validated vs tenant
---            JWKS) or the jwt plugin. Survives ai-proxy-advanced replacing the
---            Authorization header (it is request context, not a header). The
---            production Entra path. EMPIRICALLY VERIFIED against a real tenant.
---   Tier 3 — jwt_app_claim via Authorization: Bearer header (no-auth-plugin
---            fallback; not visible once ai-proxy-advanced replaced the header).
+--   Tier 2 — Kong consumer: username or custom_id set by an auth plugin
+--            (key-auth, basic-auth, openid-connect, etc.).
+--   Fallback — conf.source or "Kong Default App".
 local function resolve_app_source(conf, headers)
   if conf.app_id_header and conf.app_id_header ~= "" and conf.app_id_header ~= "off" then
     local hval = headers and (headers[conf.app_id_header] or headers[conf.app_id_header:lower()])
@@ -210,38 +237,17 @@ local function resolve_app_source(conf, headers)
     end
   end
 
-  if not conf.jwt_app_claim or conf.jwt_app_claim == "" or conf.jwt_app_claim == "off" then
-    return nil
+  local ok, consumer = pcall(function() return kong.client.get_consumer() end)
+  if ok and consumer then
+    kong.log.debug("[straiker-saas] consumer found: username=", consumer.username, " custom_id=", consumer.custom_id)
+    if consumer.username or consumer.custom_id then
+      return consumer.username or consumer.custom_id
+    end
+  else
+    kong.log.debug("[straiker-saas] no consumer on this request")
   end
 
-  -- The auth plugin (openid-connect for Entra, or the jwt plugin) leaves the
-  -- verified token here. EMPIRICALLY CONFIRMED: openid-connect populates
-  -- kong.ctx.shared.authenticated_jwt_token (and authenticated_token), and it
-  -- survives ai-proxy-advanced replacing the Authorization header.
-  local raw_token = kong.ctx.shared and kong.ctx.shared.authenticated_jwt_token
-  if not raw_token then
-    local auth = headers and (headers["authorization"] or headers["Authorization"])
-    if auth then raw_token = auth:match("^[Bb]earer%s+(.+)$") end
-  end
-  if not raw_token then return nil end
-
-  local payload_b64 = raw_token:match("^[^%.]+%.([^%.]+)%.")
-  if not payload_b64 then return nil end
-
-  local padded = payload_b64:gsub("%-", "+"):gsub("_", "/")
-  padded = padded .. string.rep("=", (4 - (#padded % 4)) % 4)
-  local json_str = ngx.decode_base64(padded)
-  if not json_str then return nil end
-
-  local ok, claims = pcall(cjson.decode, json_str)
-  if not ok or type(claims) ~= "table" then return nil end
-
-  if conf.jwt_app_claim == "auto" then
-    local val = claims.app_displayname or claims.azp or claims.appid
-    return type(val) == "string" and val ~= "" and val or nil
-  end
-  local val = claims[conf.jwt_app_claim]
-  return type(val) == "string" and val ~= "" and val or nil
+  return nil
 end
 
 local function build_payload(opts)
@@ -250,7 +256,7 @@ local function build_payload(opts)
   local meta = client_metadata(opts.headers, opts.body)
   local trace_id   = opts.headers["x-trace-id"]
   local agent_role = opts.headers["x-agent-role"]
-  local effective_source = opts.dynamic_source or opts.conf.source
+  local effective_source = opts.dynamic_source or opts.conf.source or "Kong Default App"
   local metadata = {
     session_id = meta.session_id,
     user_name  = meta.user_name,
@@ -325,6 +331,7 @@ local function call_straiker(conf, payload)
     headers = {
       ["Authorization"] = "Bearer " .. conf.api_key,
       ["Content-Type"] = "application/json",
+      ["X-Straiker-Smart-Publish"] = "true",
     },
     ssl_verify = true,
     keepalive_timeout = 60000,
@@ -460,6 +467,8 @@ function StraikerSaaS:access(conf)
   local prompt = last_user_prompt(body.messages)
   if prompt == "" then return end
 
+  kong.log.notice("[straiker-saas] request body: ", raw)
+
   -- Stash for the response phase.
   kong.ctx.plugin.prompt = prompt
   kong.ctx.plugin.model = body.model
@@ -546,6 +555,8 @@ function StraikerSaaS:response(conf)
   local raw_body = kong.service.response.get_raw_body()
   if not raw_body or raw_body == "" then return end
 
+  kong.log.notice("[straiker-saas] response body: ", raw_body)
+
   -- Defensive gzip inflate (we ask for identity in access, but a proxy may
   -- ignore it). We only inflate our local copy for scoring; the client still
   -- receives the original bytes unless we block.
@@ -572,9 +583,6 @@ function StraikerSaaS:response(conf)
     local resp = cjson.decode(raw_body)
     if resp and resp.choices and resp.choices[1] and resp.choices[1].message then
       local msg = resp.choices[1].message
-      -- cjson.safe decodes JSON null to a sentinel; treat as missing for both
-      -- content (avoid leaking "userdata: NULL") and tool_calls (avoid skipping
-      -- the final turn when tool_calls is null).
       local content = msg.content
       if content == nil or content == cjson.null or type(content) ~= "string" then
         app_response = ""
@@ -584,6 +592,18 @@ function StraikerSaaS:response(conf)
       local tcs = msg.tool_calls
       has_tool_calls = type(tcs) == "table" and #tcs > 0
       if has_tool_calls then final_tool_calls = tcs end
+    elseif resp and type(resp.content) == "table" and resp.role == "assistant" then
+      local parts = {}
+      for _, block in ipairs(resp.content) do
+        if block.type == "text" and type(block.text) == "string" then
+          parts[#parts + 1] = block.text
+        elseif block.type == "tool_use" then
+          has_tool_calls = true
+          if not final_tool_calls then final_tool_calls = {} end
+          final_tool_calls[#final_tool_calls + 1] = block
+        end
+      end
+      app_response = table.concat(parts, "")
     end
   end
 

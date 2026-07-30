@@ -66,13 +66,21 @@ local function encode_event(e, ctx, conf)
 end
 
 -- fire-and-forget post (monitor mode) via a light timer — zero added latency.
-local function post_async(conf, event_json, label)
+-- Logs "recon" lines carrying session_id + event + turn_id so the same message
+-- can be reconciled between Kong (this log / the X-Straiker-Session-Id header)
+-- and the Straiker Console (the turn's session_id).
+local function post_async(conf, event_json, label, sid)
   local ok = ngx.timer.at(0, function(premature)
     if premature then return end
     local res, err = detect.post(conf, event_json, false)
     if conf.debug then
-      if res then kong.log.notice(LOG, " ", label, " detect ", res.status, " ", (res.body or ""):sub(1, 160))
-      else kong.log.warn(LOG, " ", label, " detect error: ", err or "?") end
+      if res then
+        local turn = (res.body or ""):match('"turn_id"%s*:%s*"([^"]+)"') or "-"
+        kong.log.notice(LOG, " recon sid=", sid or "?", " event=", label,
+          " status=", res.status, " turn_id=", turn)
+      else
+        kong.log.warn(LOG, " ", label, " detect error: ", err or "?")
+      end
     end
   end)
   if not ok and conf.debug then kong.log.warn(LOG, " timer spawn failed") end
@@ -191,7 +199,7 @@ function StraikerCoding:access(conf)
             { ["Content-Type"] = "application/json" })
         end
       else
-        post_async(conf, ej, e.hook_event_name)
+        post_async(conf, ej, e.hook_event_name, ctx.session_id)
       end
     end
   end
@@ -232,7 +240,7 @@ function StraikerCoding:response(conf)
             { ["Content-Type"] = "application/json" })
         end
       else
-        post_async(conf, ej, "PreToolUse")
+        post_async(conf, ej, "PreToolUse", sid)
       end
     end
   end

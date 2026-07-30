@@ -19,3 +19,4 @@ lab-coding/.env
 lab-coding/out/
 lab-coding/kong/out/
 lab-coding/**/ws-*/
+lab-coding/konnect/out/

@@ -1,0 +1,6 @@
+service: tokenusage
+env: staging
+quota:
+  team_a: 1000
+  team_b: 2500
+autotrigger: true

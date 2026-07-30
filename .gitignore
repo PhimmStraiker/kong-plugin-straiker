@@ -15,3 +15,7 @@ scripts/
 
 # Internal planning doc — never public
 MCP_DISCOVERY_PLAN.md
+lab-coding/.env
+lab-coding/out/
+lab-coding/kong/out/
+lab-coding/**/ws-*/

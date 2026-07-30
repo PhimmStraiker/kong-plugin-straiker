@@ -1,0 +1,73 @@
+local typedefs = require "kong.db.schema.typedefs"
+
+-- Guard: this plugin posts synthesized Claude Code hook events to the
+-- coding-agent detect path (/api/v1/detect + x-tool: claude-code), NOT the
+-- generic gateway webhook. The /detect/webhook path was verified to not enforce
+-- the coding-agent pipeline, so reject a URL pointing at it.
+local function not_webhook(url)
+  if type(url) == "string" and url:match("/webhook%s*$") then
+    return nil, "detect_url must be the /api/v1/detect coding-agent path, not /detect/webhook"
+  end
+  return true
+end
+
+return {
+  name = "straiker-coding",
+  fields = {
+    { protocols = typedefs.protocols_http },
+    { config = {
+        type = "record",
+        fields = {
+          { api_key = {
+              type = "string", required = true, encrypted = true, referenceable = true,
+          } },
+          { detect_url = {
+              type = "string",
+              default = "https://api.prod.straiker.ai/api/v1/detect",
+              custom_validator = not_webhook,
+          } },
+          { x_tool = {
+              type = "string", default = "claude-code",
+          } },
+          { mode = {
+              -- monitor: synthesize + score + surface in Console, never block.
+              -- block: deny tool calls whose PreToolUse/PostToolUse verdict is deny.
+              type = "string", default = "monitor",
+              one_of = { "monitor", "block" },
+          } },
+          { chatter_filter = {
+              -- Drop Claude Code utility/scaffolding calls (titlegen, suggestion
+              -- mode, recap, quota, zero-tool turns) before emitting
+              -- UserPromptSubmit — this is what prevents FP detections.
+              type = "boolean", default = true,
+          } },
+          { session_header = {
+              type = "string", default = "X-Straiker-Session-Id",
+          } },
+          { user_name_header = {
+              type = "string", default = "X-Straiker-User-Name",
+          } },
+          { user_name_default = {
+              type = "string", default = "kong-coding",
+          } },
+          { model_override = {
+              type = "string", default = nil,
+          } },
+          { sign_payloads = {
+              type = "boolean", default = true,
+          } },
+          { fail_open = {
+              -- Input gate behaviour when the detect call errors. Response-side
+              -- enforcement always fails open (a real answer is never withheld).
+              type = "boolean", default = true,
+          } },
+          { timeout_ms = {
+              type = "integer", default = 5000,
+          } },
+          { debug = {
+              type = "boolean", default = false,
+          } },
+        },
+    } },
+  },
+}

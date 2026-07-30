@@ -1,0 +1,49 @@
+_format_version: "3.0"
+_transform: true
+
+services:
+  - name: anthropic
+    url: https://api.anthropic.com
+    # Claude Code -> ANTHROPIC_BASE_URL=http://localhost:8000 -> here -> Anthropic
+    routes:
+      - name: anthropic-messages
+        paths:
+          - /v1/messages
+        strip_path: false
+        protocols:
+          - http
+          - https
+    plugins:
+      - name: straiker-coding
+        config:
+          api_key: "__STRAIKER_KEY__"
+          detect_url: "https://api.prod.straiker.ai/api/v1/detect"
+          x_tool: "claude-code"
+          mode: "__MODE__"
+          chatter_filter: true
+          user_name_default: "phimmasone@straiker.ai"
+          sign_payloads: true
+          debug: true
+
+  - name: bedrock
+    url: https://bedrock-runtime.us-east-1.amazonaws.com
+    # Claude Code (CLAUDE_CODE_USE_BEDROCK=1) -> ANTHROPIC_BEDROCK_BASE_URL -> here
+    routes:
+      - name: bedrock-invoke
+        paths:
+          - /model
+        strip_path: false
+        protocols:
+          - http
+          - https
+    plugins:
+      - name: straiker-coding
+        config:
+          api_key: "__STRAIKER_KEY__"
+          detect_url: "https://api.prod.straiker.ai/api/v1/detect"
+          x_tool: "claude-code"
+          mode: "__MODE__"
+          chatter_filter: true
+          user_name_default: "phimmasone@straiker.ai"
+          sign_payloads: true
+          debug: true

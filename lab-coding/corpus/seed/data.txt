@@ -1,0 +1,4 @@
+note: rotate the staging token monthly
+note: team_b exceeded quota last week
+info: deployment pipeline uses AUTOTRIGGER on main
+note: see runbook for escalation

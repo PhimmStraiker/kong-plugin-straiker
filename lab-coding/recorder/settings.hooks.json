@@ -1,0 +1,17 @@
+{
+  "apiKeyHelper": "sh -c 'echo $ANTHROPIC_API_KEY'",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "python3 \"/Users/phimmasonephonpaseuth/Projects/Straiker Projects/StraikerGateway/kong-plugin-straiker/lab-coding/recorder/hook_recorder.py\"" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 \"/Users/phimmasonephonpaseuth/Projects/Straiker Projects/StraikerGateway/kong-plugin-straiker/lab-coding/recorder/hook_recorder.py\"" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 \"/Users/phimmasonephonpaseuth/Projects/Straiker Projects/StraikerGateway/kong-plugin-straiker/lab-coding/recorder/hook_recorder.py\"" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "python3 \"/Users/phimmasonephonpaseuth/Projects/Straiker Projects/StraikerGateway/kong-plugin-straiker/lab-coding/recorder/hook_recorder.py\"" } ] }
+    ]
+  }
+}

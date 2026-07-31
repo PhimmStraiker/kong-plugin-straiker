@@ -14,11 +14,14 @@ Outputs to konnect/out/engineering/:
   kong.jsonl                    copy of Kong's raw file-log (source of truth)
   raw/<session>_call<N>_request.json / _response.(sse|json)   literal raw wire
 """
-import base64, glob, json, os, shutil, collections
+import base64, glob, json, os, re, shutil, collections, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGDIR = os.path.join(HERE, "out", "logs")
 OUT = os.path.join(HERE, "out", "engineering")
+# only real Claude Code sessions have a UUID session_id (from metadata.user_id);
+# benchmark/probe traffic does not — filter to real traffic for the export.
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def user_prompt_of(body_json):
@@ -46,8 +49,13 @@ def load_records():
     for line in open(path):
         line = line.strip()
         if line:
-            try: recs.append(json.loads(line))
-            except Exception: pass
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            sid = str((r.get("straiker") or {}).get("session_id") or "")
+            if UUID.match(sid):        # real Claude Code sessions only
+                recs.append(r)
     return recs
 
 
@@ -55,7 +63,10 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     os.makedirs(os.path.join(OUT, "raw"), exist_ok=True)
     recs = load_records()
-    shutil.copy(os.path.join(LOGDIR, "kong.jsonl"), os.path.join(OUT, "kong.jsonl"))
+    # kong.jsonl in the export = Kong's raw file-log, real Claude Code records only
+    with open(os.path.join(OUT, "kong.jsonl"), "w") as f:
+        for r in recs:
+            f.write(json.dumps(r) + "\n")
 
     # group model calls by session (a session = one user prompt + all its calls)
     by_session = collections.OrderedDict()

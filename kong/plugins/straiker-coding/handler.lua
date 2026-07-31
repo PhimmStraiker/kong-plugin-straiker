@@ -21,6 +21,24 @@ local StraikerCoding = { PRIORITY = 755, VERSION = "0.11.0" }
 local LOG = "[straiker-coding]"
 
 -- ---------------------------------------------------------------------------
+-- raw-body capture (debug: "what Kong sees")
+-- ---------------------------------------------------------------------------
+-- When a request carries the X-Straiker-Capture header, append the raw request
+-- and raw response bytes to /straiker-capture/<session_id>.jsonl (a mounted host
+-- dir). This is what Kong actually receives/returns on the wire — one file per
+-- session, every model call in order. Binary (Bedrock event-stream) is base64'd.
+local CAPTURE_DIR = "/straiker-capture"
+
+local function capture_write(sid, record)
+  local safe = (sid or "unknown"):gsub("[^%w%-_]", "_")
+  local ok, f = pcall(io.open, CAPTURE_DIR .. "/" .. safe .. ".jsonl", "a")
+  if ok and f then
+    f:write(cjson.encode(record) .. "\n")
+    f:close()
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- helpers
 -- ---------------------------------------------------------------------------
 
@@ -167,6 +185,27 @@ function StraikerCoding:access(conf)
   local raw = read_request_body()
   if not raw then return end
 
+  -- raw-body capture ("what Kong sees") — gated on the X-Straiker-Capture header
+  if kong.request.get_header("X-Straiker-Capture") ~= nil then
+    local decoded = cjson.decode(raw)
+    local sid_cap = coding.session_id(type(decoded) == "table" and decoded or {},
+      kong.request.get_header(conf.session_header)) or kong.request.get_header(conf.session_header) or "unknown"
+    kong.ctx.plugin.capture = true
+    kong.ctx.plugin.capture_sid = sid_cap
+    -- stash a call id that persists into the response phase (ngx.var.request_id
+    -- differs between access and the buffered response phase, so pair on this).
+    kong.ctx.plugin.capture_cid = ngx.var.request_id
+    capture_write(sid_cap, {
+      ts = ngx.now(), phase = "request", rid = kong.ctx.plugin.capture_cid,
+      method = kong.request.get_method(),
+      path = kong.request.get_path_with_query(),
+      host = kong.request.get_header("host"),
+      content_type = kong.request.get_header("content-type"),
+      session_id = sid_cap,
+      body_bytes = #raw, body = raw,
+    })
+  end
+
   local ok, events, ctx, err, preq = pcall(build_request_events, conf, raw, conf.session_header)
   if not ok then
     kong.log.warn(LOG, " access build error (fail-open): ", tostring(events))
@@ -210,11 +249,29 @@ end
 -- ---------------------------------------------------------------------------
 
 function StraikerCoding:response(conf)
+  local ctype = kong.response.get_header("Content-Type") or ""
+
+  -- raw-body capture ("what Kong sees") — runs for EVERY model call on the route
+  -- when capture is on, including utility/title-gen calls the plugin doesn't score.
+  if kong.ctx.plugin.capture then
+    local craw = kong.response.get_raw_body()
+    if craw then
+      local enc, payload = "raw", craw
+      if eventstream.is_eventstream(ctype) then
+        enc = "base64"; payload = ngx.encode_base64(craw)
+      end
+      capture_write(kong.ctx.plugin.capture_sid, {
+        ts = ngx.now(), phase = "response", rid = kong.ctx.plugin.capture_cid,
+        status = kong.response.get_status(),
+        content_type = ctype, body_bytes = #craw, encoding = enc, body = payload,
+      })
+    end
+  end
+
   local sid = kong.ctx.plugin.sid
   if not sid then return end
 
   local raw = kong.response.get_raw_body()
-  local ctype = kong.response.get_header("Content-Type") or ""
   if not raw or raw == "" then return end
 
   local ok, events, ctx, parsed = pcall(build_response_events, conf, raw, ctype, sid, kong.ctx.plugin.user)

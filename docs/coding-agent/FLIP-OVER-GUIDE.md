@@ -224,6 +224,35 @@ prefer the per-terminal flip unless you specifically need the desktop app routed
 
 ---
 
+## Who you show up as in the Console (identity)
+
+Claude Code's wire traffic carries only a **session UUID** (`metadata.user_id`), **not who you
+are** — so the plugin can't derive your real identity from the request. It resolves the name
+in this order ([`handler.lua` `resolve_user`](../../kong/plugins/straiker-coding/handler.lua)):
+
+1. the value of the header named by `user_name_header` (if that header is present), else
+2. `user_name_default`, else
+3. `"kong-coding"`.
+
+If you leave `user_name_default` at a placeholder (the lab used `konnect-coding-demo`) and send
+no header, **every session shows that placeholder** — that's why turns didn't show as you.
+
+**Fix (already applied to this gateway):**
+- `user_name_header = X-Straiker-User-Name` and `user_name_default = phimmasone@straiker.ai`.
+- The toggle injects the header per session via Claude Code's `ANTHROPIC_CUSTOM_HEADERS`:
+  ```bash
+  export ANTHROPIC_CUSTOM_HEADERS="X-Straiker-User-Name: $STRAIKER_USER"   # kong-on does this
+  ```
+- Change who you are with `STRAIKER_USER` before `kong-on` (e.g. `export STRAIKER_USER="Phimm"`,
+  or `export STRAIKER_USER="$USER"` for OS-username parity with the native hooks).
+
+**Per-developer at scale (CVS):** each dev's Claude Code injects their own identity via the
+same header (from `$STRAIKER_USER` / their email / Entra) — so the Console attributes every
+turn to the right person, exactly like the endpoint hooks do. Only **new** turns are affected;
+sessions already recorded keep the label they were captured with.
+
+---
+
 ## 4. Verify it's flowing to the *right* profile
 
 Send one prompt through, then in the Console open the **coding-agent** view for the

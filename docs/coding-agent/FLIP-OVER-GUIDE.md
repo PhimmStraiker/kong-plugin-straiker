@@ -151,7 +151,10 @@ config:
 guardrail outage, and — because `debug` is off — actually receives deny decisions (with
 `debug:true` the backend returns a score breakdown *instead of* the deny, so nothing blocks).
 **You drive the real block / detect / disable policy per category at the Straiker Console**;
-the plugin just enforces it. To flip the deployed plugin to this posture idempotently:
+the plugin just enforces it — it blocks whenever Straiker's decision is `action == "block"`,
+for any event, **including the kill switch on plain conversational turns** (which the native
+hooks can't do). See **ENFORCEMENT-AND-KILLSWITCH.md** for the full model + the empirical
+enforce-vs-debug finding. To flip the deployed plugin to this posture idempotently:
 
 ```bash
 set -a && source .env.konnect && set +a

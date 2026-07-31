@@ -22,7 +22,7 @@ local sse     = require "kong.plugins.straiker-coding.sse"
 local eventstream = require "kong.plugins.straiker-coding.eventstream"
 local detect  = require "kong.plugins.straiker-coding.detect"
 
-local StraikerCoding = { PRIORITY = 755, VERSION = "0.13.0" }
+local StraikerCoding = { PRIORITY = 755, VERSION = "0.14.0" }
 local LOG = "[straiker-coding]"
 
 -- ---------------------------------------------------------------------------
@@ -114,7 +114,7 @@ local function post_enforce(conf, event_json)
   return deny, hso.permissionDecisionReason, { http = res.status, decision = hso.permissionDecision }
 end
 
--- Anthropic-shaped block response for a /v1/messages client.
+-- Anthropic-shaped block response for a NON-streaming /v1/messages client.
 local function anthropic_block_body(reason)
   return cjson.encode({
     id = "msg_blocked", type = "message", role = "assistant", model = "claude",
@@ -122,6 +122,38 @@ local function anthropic_block_body(reason)
     content = { { type = "text", text = reason } },
     usage = { input_tokens = 0, output_tokens = 0 },
   })
+end
+
+-- Anthropic-shaped block response for a STREAMING (stream:true) client: a complete,
+-- well-formed SSE message so Claude Code renders the block as the assistant's answer
+-- and ENDS the turn — rather than seeing a malformed/JSON body, discarding it, and
+-- continuing (which is what let blocked turns "keep talking").
+local function anthropic_block_sse(reason)
+  local function ev(name, data) return "event: " .. name .. "\ndata: " .. cjson.encode(data) .. "\n\n" end
+  return table.concat({
+    ev("message_start", { type = "message_start", message = {
+        id = "msg_blocked", type = "message", role = "assistant", model = "claude",
+        content = {}, stop_reason = cjson.null, stop_sequence = cjson.null,
+        usage = { input_tokens = 0, output_tokens = 0 } } }),
+    ev("content_block_start", { type = "content_block_start", index = 0,
+        content_block = { type = "text", text = "" } }),
+    ev("content_block_delta", { type = "content_block_delta", index = 0,
+        delta = { type = "text_delta", text = reason } }),
+    ev("content_block_stop", { type = "content_block_stop", index = 0 }),
+    ev("message_delta", { type = "message_delta",
+        delta = { stop_reason = "end_turn", stop_sequence = cjson.null }, usage = { output_tokens = 0 } }),
+    ev("message_stop", { type = "message_stop" }),
+  })
+end
+
+-- Terminate the request with a block the client will actually render. Streaming vs
+-- non-streaming is stashed in access from the request's `stream` flag.
+local function do_block(reason)
+  reason = reason or "Request blocked by Straiker guardrails."
+  if kong.ctx.plugin.streaming then
+    return kong.response.exit(200, anthropic_block_sse(reason), { ["Content-Type"] = "text/event-stream" })
+  end
+  return kong.response.exit(200, anthropic_block_body(reason), { ["Content-Type"] = "application/json" })
 end
 
 -- accumulate one synthesized event for the Kong log serializer:
@@ -220,6 +252,9 @@ function StraikerCoding:access(conf)
 
   kong.ctx.plugin.sid = ctx.session_id
   kong.ctx.plugin.user = ctx.user_name
+  -- remember whether the client asked for streaming, so a block is emitted in the
+  -- matching format (SSE vs JSON) from either the access or the response phase.
+  kong.ctx.plugin.streaming = raw:find('"stream"%s*:%s*true') ~= nil
   if conf.log_serialize then serialize_request(conf, raw, ctx.session_id) end
 
   if conf.debug then
@@ -233,18 +268,24 @@ function StraikerCoding:access(conf)
   for _, e in ipairs(events) do
     if first_time(ctx.session_id, evkey(e), 3600) then
       local ej = encode_event(e, ctx, conf)
-      if conf.mode == "block" and e.hook_event_name == "PostToolUse" then
+      local n = e.hook_event_name
+      -- Enforce request-side events BEFORE forwarding to the model:
+      --   UserPromptSubmit -> blocks the whole turn (this is where the Straiker kill
+      --                       switch and prompt-level threats deny — parity with the
+      --                       native UserPromptSubmit hook, and stronger: the model is
+      --                       never called).
+      --   PostToolUse      -> blocks a poisoned tool result from reaching the model.
+      if conf.mode == "block" and (n == "UserPromptSubmit" or n == "PostToolUse") then
         local deny, reason, verdict = post_enforce(conf, ej)
         if conf.log_serialize then log_event(e, verdict, ej) end
         if deny then
-          if conf.debug then kong.log.notice(LOG, " BLOCK PostToolUse ", e.tool_use_id) end
-          return kong.response.exit(200, anthropic_block_body(reason),
-            { ["Content-Type"] = "application/json" })
+          if conf.debug then kong.log.notice(LOG, " BLOCK ", n, " sid=", ctx.session_id) end
+          return do_block(reason)
         end
       elseif conf.log_serialize then
         log_event(e, score_sync(conf, ej), ej)      -- sync score -> verdict in the log
       else
-        post_async(conf, ej, e.hook_event_name, ctx.session_id)
+        post_async(conf, ej, n, ctx.session_id)
       end
     end
   end
@@ -317,8 +358,7 @@ function StraikerCoding:response(conf)
         if conf.log_serialize then log_event(e, verdict, ej) end
         if deny then
           if conf.debug then kong.log.notice(LOG, " BLOCK PreToolUse ", e.tool_name, " ", e.tool_use_id) end
-          return kong.response.exit(200, anthropic_block_body(reason),
-            { ["Content-Type"] = "application/json" })
+          return do_block(reason)
         end
       elseif conf.log_serialize then
         log_event(e, score_sync(conf, ej), ej)

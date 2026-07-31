@@ -43,6 +43,53 @@ traffic → the standard API (collection) key. Never cross them.
 
 ---
 
+## 1b. Why a separate profile — and how it sits next to the standard Straiker plugin
+
+**Why a new profile is *required*, not just tidy.** A Kong plugin instance's config holds
+**exactly one `api_key`** (it's a single required string in the schema — there is no
+multi-key field). So a Straiker key and a plugin instance are 1:1. A **second** Straiker
+key — the Claude Code key here — **must** be a **second plugin instance**. That is what a
+"new guardrail profile" means in Kong: another plugin instance carrying the second key.
+
+**They're two different plugins, so they coexist cleanly:**
+
+| Guardrail profile | Plugin | Priority | Key | Guards |
+|---|---|---|---|---|
+| Standard | `straiker` | **760** | standard **API (collection) key** | regular app / chatbot traffic |
+| Claude Code | `straiker-coding` | **755** | **Claude Code key** | Claude Code (`x-tool: claude-code`) |
+
+Different plugin **names**, so Kong lets both exist. Kong also allows **only one instance
+of a given plugin name per scope** (route/service) — which is exactly why one instance
+can't hold two keys, and why the second key rides a second instance.
+
+**Recommended topology — separate routes (clean isolation):**
+
+```
+                    ┌─ Kong route: /app  ──── straiker (760, standard API key) ──▶ chatbot/app upstream
+Kong proxy ────────►┤
+                    └─ Kong route: /cc   ──── straiker-coding (755, Claude Code key) ─▶ Anthropic / Bedrock
+```
+
+- Put the **standard `straiker`** plugin on the route(s) for regular app traffic, with the
+  **standard API key**.
+- Put the **new `straiker-coding`** plugin on a **dedicated Claude Code route/service**
+  (the one Claude Code points at), with the **Claude Code key**.
+- Because each plugin lives on its **own route**, only the matching one runs. No collision,
+  no double-scoring, each key isolated. **This is the recommended setup.**
+- Give Claude Code its own gateway address so it lands on the `/cc` route — set its
+  `KONG_URL` (below) to that route's host/path. Regular apps keep pointing at their route.
+
+**If Claude Code and regular traffic must share ONE route** (same upstream, can't split):
+both plugins attach and **both run**, ordered by priority — `straiker` (760) first, then
+`straiker-coding` (755). That means each request is processed by **both**: the standard
+plugin tries to parse Claude Code's verbose format (the very thing that breaks legacy
+guardrails — the original pain), and the coding plugin parses ordinary chatbot turns as if
+they were Claude Code. **Not recommended.** If you can't split routes, disable the standard
+`straiker` plugin on that route (leave only `straiker-coding`), or gate each plugin by
+path/header so only one applies. **Splitting routes is the right answer.**
+
+---
+
 ## 2. Configure the new plugin instance on your Kong route
 
 Attach the new `straiker-coding` profile to the Kong **service/route** that fronts the LLM

@@ -1,0 +1,1 @@
+{ "mcpServers": { "tasks": { "command": "python3", "args": ["/Users/phimmasonephonpaseuth/Projects/Straiker Projects/StraikerGateway/kong-plugin-straiker/lab-coding/konnect/mcp/tasks_server.py"] } } }

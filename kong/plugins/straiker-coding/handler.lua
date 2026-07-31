@@ -22,7 +22,7 @@ local sse     = require "kong.plugins.straiker-coding.sse"
 local eventstream = require "kong.plugins.straiker-coding.eventstream"
 local detect  = require "kong.plugins.straiker-coding.detect"
 
-local StraikerCoding = { PRIORITY = 755, VERSION = "0.12.0" }
+local StraikerCoding = { PRIORITY = 755, VERSION = "0.13.0" }
 local LOG = "[straiker-coding]"
 
 -- ---------------------------------------------------------------------------
@@ -54,6 +54,7 @@ local function evkey(e)
   if n == "PreToolUse" then return "pre:" .. tostring(e.tool_use_id) end
   if n == "PostToolUse" then return "post:" .. tostring(e.tool_use_id) end
   if n == "UserPromptSubmit" then return "prompt:" .. ngx.md5(e.prompt or "") end
+  if n == "Stop" then return "stop:" .. ngx.md5(e.app_response or "") end
   return n
 end
 
@@ -306,9 +307,12 @@ function StraikerCoding:response(conf)
   end
 
   for _, e in ipairs(events) do
-    if e.hook_event_name == "PreToolUse" and first_time(sid, evkey(e), 3600) then
+    local n = e.hook_event_name
+    if (n == "PreToolUse" or n == "Stop") and first_time(sid, evkey(e), 3600) then
       local ej = encode_event(e, ctx, conf)
-      if conf.mode == "block" then
+      -- Stop (the final assistant response) is monitor-only — the answer is
+      -- already generated, so it is never blocked, only scored/surfaced.
+      if conf.mode == "block" and n == "PreToolUse" then
         local deny, reason, verdict = post_enforce(conf, ej)
         if conf.log_serialize then log_event(e, verdict, ej) end
         if deny then
@@ -319,7 +323,7 @@ function StraikerCoding:response(conf)
       elseif conf.log_serialize then
         log_event(e, score_sync(conf, ej), ej)
       else
-        post_async(conf, ej, "PreToolUse", sid)
+        post_async(conf, ej, n, sid)
       end
     end
   end

@@ -297,11 +297,30 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
         e.tool_name = tu.name
         e.tool_input = hook_tool_input(tu.name, tu.input)
         e.tool_use_id = tu.id
-        -- MCP passthrough
+        -- MCP passthrough. Claude Code names MCP tools mcp__<server>__<tool>
+        -- (the server key can itself contain single underscores; the delimiter
+        -- is the double underscore). Split on "__" so multi-word servers work.
         if type(tu.name) == "string" and tu.name:match("^mcp__") then
-          local server = tu.name:match("^mcp__([^_]+)")
-          e.mcp_server_name = server
+          local server, mtool = tu.name:match("^mcp__(.-)__(.+)$")
+          e.mcp_server_name = server or tu.name:match("^mcp__(.+)$")
+          e.mcp_tool_name = mtool
         end
+        events[#events + 1] = e
+      end
+    end
+
+    -- 4. Stop: the final assistant answer. Claude Code's native Stop hook does
+    -- NOT carry this (a known coding-agent limitation) — but the gateway sees
+    -- the response on the wire, so it can capture and forward the model's final
+    -- output (enables output-side guardrails the endpoint hook cannot provide).
+    if parsed_resp.stop_reason == "end_turn"
+       and type(parsed_resp.text) == "string" and parsed_resp.text ~= "" then
+      local dkey = "stop:" .. parsed_resp.text:sub(1, 96)
+      if not seen[dkey] then
+        seen[dkey] = true
+        local e = base("Stop")
+        e.app_response = parsed_resp.text
+        e.stop_reason = parsed_resp.stop_reason
         events[#events + 1] = e
       end
     end

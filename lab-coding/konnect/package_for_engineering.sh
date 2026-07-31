@@ -13,15 +13,31 @@ echo "1. regenerate the engineering export (real Claude Code sessions only)"
 python3 "$HERE/export_engineering.py" >/dev/null
 
 echo "2. assemble package"
-mkdir -p "$PKG/01-docs" "$PKG/02-kong-logs" "$PKG/03-mapping" "$PKG/04-raw-wire" "$PKG/05-plugin-source"
+mkdir -p "$PKG/01-docs" "$PKG/02-kong-logs" "$PKG/03-mapping" "$PKG/04-raw-wire" \
+         "$PKG/05-plugin-source" "$PKG/06-mcp-server" "$PKG/07-prod-activity-export"
 
-# docs
-cp "$REPO/docs/coding-agent/PLUGIN-GUIDE.md" \
-   "$REPO/docs/coding-agent/TEAM-FAQ.md" \
-   "$REPO/docs/coding-agent/mapping-analysis.md" \
-   "$REPO/docs/coding-agent/latency-analysis.md" \
-   "$REPO/docs/coding-agent/claude-code-wire-vs-hooks-micro.md" \
-   "$REPO/docs/coding-agent/SUMMARY.md" "$PKG/01-docs/" 2>/dev/null || true
+# docs (all coding-agent docs, incl. the backend-change note for the final response)
+cp "$REPO/docs/coding-agent/"*.md "$PKG/01-docs/" 2>/dev/null || true
+
+# MCP: the stdio server + Claude Code config used to exercise mcp__ tool calls
+cp "$HERE/mcp/tasks_server.py" "$HERE/mcp/mcp-config.json" "$PKG/06-mcp-server/" 2>/dev/null || true
+
+# prod evidence: the Defend activity CSV export (shows app_response=null -> the
+# backend gap for the final response). Copied if present next to this package.
+LATEST_CSV="$(ls -t "$HERE/out/"*.csv 2>/dev/null | head -1)"
+if [ -n "${LATEST_CSV:-}" ]; then
+  cp "$LATEST_CSV" "$PKG/07-prod-activity-export/defend_activity_export.csv"
+  cat > "$PKG/07-prod-activity-export/README.md" <<'RM'
+# Prod Defend activity export (evidence)
+
+Full "Download Prompts" CSV from the Defend app (there is no API to pull this —
+it is the UI export). Use it to verify what Straiker currently stores.
+
+Key finding: every `user_interaction_record` has `app_response=null` — including
+the Stop turns — so the model's final answer is NOT persisted today, even though
+the gateway sends it. See `../01-docs/BACKEND-CHANGE-final-response.md`.
+RM
+fi
 
 # kong's raw log (real sessions) — the source of truth
 cp "$HERE/out/engineering/kong.jsonl" "$PKG/02-kong-logs/kong_file_log.jsonl"
@@ -57,10 +73,15 @@ guardrail plugin, exported **from Kong's own file-log**.
 **Dataset:** ${RECORDS} real model calls across ${SESSIONS} sessions
 (${ANTH} Anthropic + ${BEDR} Bedrock), ${EVENTS} hook events posted to Straiker.
 
+This dataset (plugin v0.13.0) includes: **Stop events** (the model's final answer,
+captured from the wire — the native hook cannot do this) and **MCP tool calls**
+(\`mcp__<server>__<tool>\` captured with mcp_server_name/mcp_tool_name).
+
 ## Contents
 - \`01-docs/\` — how it works, exact parsing + event-synthesis table, multi-call
   timing, latency, config, how to configure Kong for Claude Code (PLUGIN-GUIDE.md),
-  and the team FAQ.
+  the team FAQ, and **BACKEND-CHANGE-final-response.md** (the backend edit needed to
+  persist + display the final assistant response the gateway already sends).
 - \`02-kong-logs/kong_file_log.jsonl\` — **Kong's raw file-log** (source of truth).
   Each line = Kong's log serializer for one model call, incl. \`straiker.request_body\`
   / \`response_body\` (the literal wire), \`straiker.events\` (synthesized hook events +
@@ -71,8 +92,19 @@ guardrail plugin, exported **from Kong's own file-log**.
   and \`mapping.jsonl\` (one structured record per event).
 - \`04-raw-wire/\` — the literal request/response bytes per model call
   (\`<session>_call<N>_request.json\`, \`_response.(sse|json|eventstream.b64)\`).
-- \`05-plugin-source/\` — the plugin Lua (coding_agent, sse, eventstream, detect,
-  schema, handler).
+- \`05-plugin-source/\` — the plugin Lua v0.13.0 (coding_agent, sse, eventstream,
+  detect, schema, handler).
+- \`06-mcp-server/\` — the stdio MCP server + Claude Code \`mcp-config.json\` used to
+  generate the real \`mcp__tasks__*\` tool calls in the dataset.
+- \`07-prod-activity-export/\` — the prod Defend activity CSV export (evidence that
+  \`app_response\` is currently null / not stored; see the backend-change doc).
+
+## Two gateway advantages over the endpoint hooks (both in this data)
+1. **Final assistant response.** The native Claude Code Stop hook omits it; the
+   gateway captures it from the wire and sends it (Stop events here). Straiker must
+   still be changed to persist + display it — see \`01-docs/BACKEND-CHANGE-final-response.md\`.
+2. **MCP tool calls.** Captured from the LLM wire as \`PreToolUse\` with
+   \`mcp_server_name\`/\`mcp_tool_name\` — no per-endpoint MCP config needed.
 
 ## The flow
 \`\`\`

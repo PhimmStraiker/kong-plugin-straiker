@@ -22,7 +22,7 @@ local sse     = require "kong.plugins.straiker-coding.sse"
 local eventstream = require "kong.plugins.straiker-coding.eventstream"
 local detect  = require "kong.plugins.straiker-coding.detect"
 
-local StraikerCoding = { PRIORITY = 755, VERSION = "0.14.0" }
+local StraikerCoding = { PRIORITY = 755, VERSION = "0.15.0" }
 local LOG = "[straiker-coding]"
 
 -- ---------------------------------------------------------------------------
@@ -101,18 +101,10 @@ local function score_sync(conf, event_json)
            action = b.action, reason = b.reason }
 end
 
--- synchronous enforcement (block mode). returns deny?, reason, verdict.
-local function post_enforce(conf, event_json)
-  local res, err = detect.post(conf, event_json, true)
-  if not res then
-    if conf.debug then kong.log.warn(LOG, " enforce detect error (fail-open): ", err or "?") end
-    return false, nil, { detect_error = err or "unreachable" }
-  end
-  local body = cjson.decode(res.body or "") or {}
-  local hso = body.hookSpecificOutput or {}
-  local deny = hso.permissionDecision == "deny"
-  return deny, hso.permissionDecisionReason, { http = res.status, decision = hso.permissionDecision }
-end
+-- (Block decisions live in enforce_decision(), defined below after log_event/do_block.
+--  We intentionally block on Straiker's action=="block" — the actual decision — rather
+--  than the hookSpecificOutput deny signal, which the enforce path omits for
+--  UserPromptSubmit. See the note on enforce_decision.)
 
 -- Anthropic-shaped block response for a NON-streaming /v1/messages client.
 local function anthropic_block_body(reason)
@@ -133,7 +125,7 @@ local function anthropic_block_sse(reason)
   return table.concat({
     ev("message_start", { type = "message_start", message = {
         id = "msg_blocked", type = "message", role = "assistant", model = "claude",
-        content = {}, stop_reason = cjson.null, stop_sequence = cjson.null,
+        content = cjson.empty_array, stop_reason = cjson.null, stop_sequence = cjson.null,
         usage = { input_tokens = 0, output_tokens = 0 } } }),
     ev("content_block_start", { type = "content_block_start", index = 0,
         content_block = { type = "text", text = "" } }),
@@ -149,7 +141,12 @@ end
 -- Terminate the request with a block the client will actually render. Streaming vs
 -- non-streaming is stashed in access from the request's `stream` flag.
 local function do_block(reason)
-  reason = reason or "Request blocked by Straiker guardrails."
+  -- Straiker may return reason=null (-> cjson.null userdata, which is TRUTHY in Lua) or
+  -- an empty string; a null/empty text_delta makes Claude Code render nothing. Guard on
+  -- the actual type so the block always carries readable text.
+  if type(reason) ~= "string" or reason == "" then
+    reason = "Request blocked by Straiker guardrails."
+  end
   if kong.ctx.plugin.streaming then
     return kong.response.exit(200, anthropic_block_sse(reason), { ["Content-Type"] = "text/event-stream" })
   end
@@ -168,6 +165,28 @@ local function log_event(e, verdict, payload_json)
     detect_payload = payload_json and cjson.decode(payload_json) or nil,  -- exact body POSTed to Straiker
     verdict = verdict,                                                    -- Straiker response
   }
+end
+
+-- Enforcement decision. Score the event on the scoring path (score_sync) and BLOCK
+-- whenever Straiker's decision is action=="block" — regardless of category, severity,
+-- or which field carries it. This is deliberately broader than the enforce path's
+-- hookSpecificOutput deny: the backend gates non-tool events out of the enforce
+-- response (returns {} for UserPromptSubmit before `action` is even consulted —
+-- argus helpers.py), so the enforce contract silently passes prompt-only turns and the
+-- kill switch. The gateway can see the actual decision (action=block, which the kill
+-- switch sets on EVERY event) and act on it — something the native hook handler, which
+-- only reads hookSpecificOutput.permissionDecision, structurally cannot do.
+-- Returns (should_block, reason). Honors fail_open on a detect error.
+local function enforce_decision(conf, e, ej)
+  local verdict = score_sync(conf, ej)
+  if conf.log_serialize then log_event(e, verdict, ej) end
+  if verdict.detect_error then
+    return (conf.fail_open == false), "Straiker guardrail unavailable (fail-closed)."
+  end
+  if verdict.action == "block" then
+    return true, verdict.reason or "Request blocked by Straiker guardrails."
+  end
+  return false
 end
 
 -- ---------------------------------------------------------------------------
@@ -270,15 +289,13 @@ function StraikerCoding:access(conf)
       local ej = encode_event(e, ctx, conf)
       local n = e.hook_event_name
       -- Enforce request-side events BEFORE forwarding to the model:
-      --   UserPromptSubmit -> blocks the whole turn (this is where the Straiker kill
-      --                       switch and prompt-level threats deny — parity with the
-      --                       native UserPromptSubmit hook, and stronger: the model is
-      --                       never called).
+      --   UserPromptSubmit -> blocks the whole TURN (kill switch / prompt-level block);
+      --                       the model is never called. The enforce path can't carry
+      --                       this, so we key on action=block (see enforce_decision).
       --   PostToolUse      -> blocks a poisoned tool result from reaching the model.
       if conf.mode == "block" and (n == "UserPromptSubmit" or n == "PostToolUse") then
-        local deny, reason, verdict = post_enforce(conf, ej)
-        if conf.log_serialize then log_event(e, verdict, ej) end
-        if deny then
+        local blk, reason = enforce_decision(conf, e, ej)
+        if blk then
           if conf.debug then kong.log.notice(LOG, " BLOCK ", n, " sid=", ctx.session_id) end
           return do_block(reason)
         end
@@ -354,9 +371,8 @@ function StraikerCoding:response(conf)
       -- Stop (the final assistant response) is monitor-only — the answer is
       -- already generated, so it is never blocked, only scored/surfaced.
       if conf.mode == "block" and n == "PreToolUse" then
-        local deny, reason, verdict = post_enforce(conf, ej)
-        if conf.log_serialize then log_event(e, verdict, ej) end
-        if deny then
+        local blk, reason = enforce_decision(conf, e, ej)
+        if blk then
           if conf.debug then kong.log.notice(LOG, " BLOCK PreToolUse ", e.tool_name, " ", e.tool_use_id) end
           return do_block(reason)
         end

@@ -2,59 +2,70 @@
 
 Two things to set up, in this order:
 
-1. **A dedicated Straiker "coding agent" guardrail profile** (its own app / collection
-   key) so gateway traffic doesn't collide with your other collections.
+1. **A new, dedicated guardrail profile in Kong** for the Claude Code path — its own
+   `straiker-coding` plugin instance, configured with a **Claude Code key** (not the
+   standard API key).
 2. **Point Claude Code at the Kong gateway** (one env var — reversible in one command).
 
 ---
 
-## 1. Give it its own coding-agent guardrail profile (own collection key)
+## 1. Create a NEW guardrail profile in Kong — and use a Claude Code key
 
-The plugin's `config.api_key` is a Straiker **app-scoped detect key**. That key *is* the
-collection: every event the plugin posts (`x-tool: claude-code`) lands in the app that
-key belongs to. If you reuse an existing app's key, gateway events **collide** with that
-app's traffic in the Console — same collection, mixed sources, mixed policy.
+**This path cannot run off the standard "API" key.** In Straiker there are two different
+key types, and they are not interchangeable:
 
-So create a **separate Straiker app** for the Kong-gateway coding traffic and use *its*
-detect key. Then the gateway path has its own card, its own policy (monitor vs block),
-and its own history — cleanly isolated from:
+| Key type | What it is | Where it routes |
+|---|---|---|
+| **Standard API key** | the **collection key** for normal app / chatbot traffic | the app's regular prompt/response collection |
+| **Claude Code key** | the coding-agent key (same type the native Claude Code hooks use) | the **coding-agent** pipeline (`x-tool: claude-code` → HookDispatcher) |
 
-- the endpoint **hook** coding agent (if you also run Claude Code hooks), and
-- any chatbot / other app collections on the same tenant.
+If you point the plugin at the **standard API key**, the coding events land in that key's
+**collection** and collide with your regular app traffic — wrong pipeline, wrong policy,
+mixed data. The plugin sends `x-tool: claude-code`, so it needs a **Claude Code key** to
+route to the coding-agent path and get its own coding-agent card in the Console.
+
+So: **create a new guardrail profile in Kong** — a *separate* `straiker-coding` plugin
+instance dedicated to the Claude Code route — and set its `api_key` to a **Claude Code
+key**, not the standard API/collection key.
 
 **Do it once:**
 
-1. Straiker Console → create an app, e.g. **"Claude Code — Kong Gateway"** (coding-agent
-   type). Copy its detect key. *(For this lab we used the dedicated coding-agent key
-   `0d51fa60-…`, deliberately kept out of the demo SE key so it shows separately.)*
-2. Put that key in the plugin config (below). Nothing else shares it.
+1. In Straiker, provision a **Claude Code key** for the coding agent (this is a distinct
+   key type from the standard API key). *(In this lab that key is `0d51fa60-…`,
+   deliberately kept out of the standard demo SE / collection key so it shows separately.)*
+2. In Kong, add a **new `straiker-coding` plugin** on the Claude Code route/service and
+   put that Claude Code key in `config.api_key`. Don't reuse an existing Straiker plugin
+   instance that carries the standard API key — stand up its own profile.
 
-Rule of thumb: **one guardrail profile per traffic source.** Gateway = its own app key.
-Hooks = their own. Chatbots = theirs. Keys are the collection boundary — don't cross them.
+Rule of thumb: **one guardrail profile per traffic source, keyed by the matching key
+type.** Gateway Claude Code → its own Kong profile + a Claude Code key. Regular app
+traffic → the standard API (collection) key. Never cross them.
 
 ---
 
-## 2. Configure the plugin on your Kong service
+## 2. Configure the new plugin instance on your Kong route
 
-The plugin attaches to the Kong **service/route** that fronts the LLM (Anthropic and/or
-Bedrock). Minimum config:
+Attach the new `straiker-coding` profile to the Kong **service/route** that fronts the LLM
+(Anthropic and/or Bedrock). Minimum config:
 
 ```
 name: straiker-coding
 config:
-  api_key:  <the dedicated coding-agent app detect key>   # <-- the collection key from step 1
+  api_key:  <a Claude Code key>                            # NOT the standard API/collection key
   detect_url: https://<your-straiker>/api/v1/detect        # NOT /webhook
   x_tool:   claude-code
   mode:     monitor        # start here; flip to "block" when you're ready
 ```
 
-Update it on Konnect with a **PUT** to the plugin (PATCH returns 405):
+Create it on Konnect with a **POST** (new profile), or **PUT** to update an existing one
+(PATCH returns 405):
 
 ```bash
-curl -sS -X PUT \
-  "https://<region>.api.konghq.com/v2/control-planes/$CP_ID/core-entities/plugins/$PLUGIN_ID" \
+# NEW guardrail profile on the Claude Code route:
+curl -sS -X POST \
+  "https://<region>.api.konghq.com/v2/control-planes/$CP_ID/core-entities/routes/$CC_ROUTE_ID/plugins" \
   -H "Authorization: Bearer $KONNECT_PAT" -H "Content-Type: application/json" \
-  -d '{"name":"straiker-coding","config":{"api_key":"<coding-agent-app-key>",
+  -d '{"name":"straiker-coding","config":{"api_key":"<claude-code-key>",
        "detect_url":"https://<your-straiker>/api/v1/detect","x_tool":"claude-code","mode":"monitor"}}'
 ```
 
@@ -97,12 +108,13 @@ That's the whole flip. `kong-off` (or unsetting `ANTHROPIC_BASE_URL` /
 
 ---
 
-## 4. Verify it's flowing to the *right* collection
+## 4. Verify it's flowing to the *right* profile
 
-Send one prompt through, then in the Console open the **"Claude Code — Kong Gateway"** app
-(the one whose key you configured). You should see coding-agent events
-(UserPromptSubmit / PreToolUse / PostToolUse) show up there **and nowhere else** — proof
-the collection key is isolated and nothing collided.
+Send one prompt through, then in the Console open the **coding-agent** view for the
+**Claude Code key** you configured. You should see coding-agent events (UserPromptSubmit /
+PreToolUse / PostToolUse) show up there **and nowhere else** — in particular *not* mixed
+into your standard-API-key collection. That's the proof the new guardrail profile is
+isolated on its own Claude Code key and nothing collided.
 
 > Note: `Straiker-Debug: TRUE` and enforcement are mutually exclusive backend-side. Leave
 > debug off in `block` mode.

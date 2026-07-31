@@ -1,5 +1,25 @@
 # Latency analysis: buffered vs streaming enforcement
 
+## Measured on the Konnect data plane (real, v0.12.0)
+
+Deterministic Claude-Code-shaped request, median of 5 through the live Konnect DP:
+
+| Path | Median total | Added vs direct | Token streaming |
+|---|---|---|---|
+| Direct → Anthropic | ~0.79 s | — | yes (first token ~0.5 s) |
+| Kong, **transparent detection** (`mode: monitor`, `log_serialize: false`, async scoring) | ~0.65 s | **≈ 0** | no (buffered) |
+| Kong, **sync scoring** (`log_serialize: true`, verdict in the Kong log) | ~0.88 s | **~+95 ms** (2 inline detect round-trips) | no (buffered) |
+
+Streaming benchmark (300-word generation): direct first token ~0.5 s, whole
+answer ~5.6 s; through Kong the client gets nothing until the whole answer (~5 s)
+— buffering removes token streaming in every mode. The two effects below explain
+this; the numbers above are the current, measured reality.
+
+---
+
+## The design tradeoff (why buffering)
+
+
 The `straiker-coding` plugin must inspect the model's response to synthesize
 `PreToolUse` events (the tool call the model wants to make). To *block* a tool
 call before the client executes it, the plugin has to see the whole `tool_use`

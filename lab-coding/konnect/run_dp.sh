@@ -15,7 +15,7 @@ emit() { # $1 var value  $2 outfile
 emit "$KONG_CLUSTER_CERT" "$TLS/tls.crt"
 emit "$KONG_CLUSTER_CERT_KEY" "$TLS/tls.key"
 chmod 600 "$TLS/tls.key"
-mkdir -p "$TLS/capture"; chmod 777 "$TLS/capture"   # raw-body capture (kong user writes here)
+mkdir -p "$TLS/logs"; chmod 777 "$TLS/logs"   # Kong file-log output (kong user writes here)
 
 docker rm -f straiker-konnect-dp >/dev/null 2>&1 || true
 
@@ -40,7 +40,7 @@ docker run -d --name straiker-konnect-dp \
   -e "KONG_LOG_LEVEL=notice" \
   -v "$REPO/kong/plugins/straiker:/usr/local/share/lua/5.1/kong/plugins/straiker:ro" \
   -v "$REPO/kong/plugins/straiker-coding:/usr/local/share/lua/5.1/kong/plugins/straiker-coding:ro" \
-  -v "$TLS/capture:/straiker-capture" \
+  -v "$TLS/logs:/straiker-logs" \
   -v "$TLS/tls.crt:/kong/tls.crt:ro" \
   -v "$TLS/tls.key:/kong/tls.key:ro" \
   -p 8000:8000 -p 8100:8100 \

@@ -5,11 +5,16 @@
 --
 -- Buffered design (access + response): the response is fully buffered so
 -- PreToolUse can be scored and, in block mode, the tool call removed before the
--- client executes it. A streaming-hold variant (preserves token streaming) is
--- tracked separately — see docs/latency-analysis.md.
+-- client executes it.
+--
+-- Observability: when `log_serialize` is on, the plugin enriches Kong's native
+-- log serializer (kong.log.set_serialize_value) with the raw request/response
+-- bodies, the resolved session, the synthesized hook events, and the REAL
+-- Straiker verdict (scored synchronously so it lands in the same Kong log line).
+-- A Kong logging plugin (file-log/http-log) then exports exactly what Kong sees.
 --
 -- Robustness contract: all parsing/synthesis runs under pcall so a parser bug
--- fails OPEN (traffic passes through untouched) and never 500s the developer.
+-- fails OPEN (traffic passes through untouched) and never 500s the client.
 -- kong.response.exit (the block action) is only ever invoked OUTSIDE pcall.
 local cjson   = require "cjson.safe"
 local coding  = require "kong.plugins.straiker-coding.coding_agent"
@@ -17,26 +22,8 @@ local sse     = require "kong.plugins.straiker-coding.sse"
 local eventstream = require "kong.plugins.straiker-coding.eventstream"
 local detect  = require "kong.plugins.straiker-coding.detect"
 
-local StraikerCoding = { PRIORITY = 755, VERSION = "0.11.0" }
+local StraikerCoding = { PRIORITY = 755, VERSION = "0.12.0" }
 local LOG = "[straiker-coding]"
-
--- ---------------------------------------------------------------------------
--- raw-body capture (debug: "what Kong sees")
--- ---------------------------------------------------------------------------
--- When a request carries the X-Straiker-Capture header, append the raw request
--- and raw response bytes to /straiker-capture/<session_id>.jsonl (a mounted host
--- dir). This is what Kong actually receives/returns on the wire — one file per
--- session, every model call in order. Binary (Bedrock event-stream) is base64'd.
-local CAPTURE_DIR = "/straiker-capture"
-
-local function capture_write(sid, record)
-  local safe = (sid or "unknown"):gsub("[^%w%-_]", "_")
-  local ok, f = pcall(io.open, CAPTURE_DIR .. "/" .. safe .. ".jsonl", "a")
-  if ok and f then
-    f:write(cjson.encode(record) .. "\n")
-    f:close()
-  end
-end
 
 -- ---------------------------------------------------------------------------
 -- helpers
@@ -83,10 +70,7 @@ local function encode_event(e, ctx, conf)
   return cjson.encode(e)
 end
 
--- fire-and-forget post (monitor mode) via a light timer — zero added latency.
--- Logs "recon" lines carrying session_id + event + turn_id so the same message
--- can be reconciled between Kong (this log / the X-Straiker-Session-Id header)
--- and the Straiker Console (the turn's session_id).
+-- fire-and-forget post (monitor, no log_serialize) via a timer — zero latency.
 local function post_async(conf, event_json, label, sid)
   local ok = ngx.timer.at(0, function(premature)
     if premature then return end
@@ -104,19 +88,29 @@ local function post_async(conf, event_json, label, sid)
   if not ok and conf.debug then kong.log.warn(LOG, " timer spawn failed") end
 end
 
--- synchronous post returning deny?, reason (block mode)
+-- synchronous scoring (monitor + log): returns the full Straiker verdict so it
+-- can be written into the Kong log line. enforce=false => Straiker-Debug on =>
+-- response carries score/category/severity/action/turn_id.
+local function score_sync(conf, event_json)
+  local res, err = detect.post(conf, event_json, false)
+  if not res then return { detect_error = err or "unreachable" } end
+  local b = cjson.decode(res.body or "") or {}
+  return { http = res.status, turn_id = b.turn_id, score = b.score,
+           score_category = b.score_category, severity = b.severity,
+           action = b.action, reason = b.reason }
+end
+
+-- synchronous enforcement (block mode). returns deny?, reason, verdict.
 local function post_enforce(conf, event_json)
   local res, err = detect.post(conf, event_json, true)
   if not res then
     if conf.debug then kong.log.warn(LOG, " enforce detect error (fail-open): ", err or "?") end
-    return false
+    return false, nil, { detect_error = err or "unreachable" }
   end
   local body = cjson.decode(res.body or "") or {}
   local hso = body.hookSpecificOutput or {}
-  if hso.permissionDecision == "deny" then
-    return true, hso.permissionDecisionReason or "Blocked by Straiker policy"
-  end
-  return false
+  local deny = hso.permissionDecision == "deny"
+  return deny, hso.permissionDecisionReason, { http = res.status, decision = hso.permissionDecision }
 end
 
 -- Anthropic-shaped block response for a /v1/messages client.
@@ -129,15 +123,28 @@ local function anthropic_block_body(reason)
   })
 end
 
+-- accumulate one synthesized event for the Kong log serializer:
+--   what the plugin synthesized  +  the EXACT payload posted to Straiker  +  the verdict.
+local function log_event(e, verdict, payload_json)
+  local le = kong.ctx.plugin.log_events
+  if not le then le = {}; kong.ctx.plugin.log_events = le end
+  le[#le + 1] = {
+    hook_event_name = e.hook_event_name,
+    tool_name = e.tool_name, tool_input = e.tool_input,
+    prompt = e.prompt, tool_use_id = e.tool_use_id,
+    detect_payload = payload_json and cjson.decode(payload_json) or nil,  -- exact body POSTed to Straiker
+    verdict = verdict,                                                    -- Straiker response
+  }
+end
+
 -- ---------------------------------------------------------------------------
 -- pure builders (pcall-safe: parsing only, no exit, no I/O)
 -- ---------------------------------------------------------------------------
 
--- returns events, ctx  (request-side: PostToolUse, UserPromptSubmit)
 local function build_request_events(conf, raw, session_header)
   local body = cjson.decode(raw)
   if type(body) ~= "table" then return nil end
-  if conf.agent ~= "off" and not coding.is_claude_code(body) then return nil end
+  if conf.agent ~= "off" and not coding.is_claude_code(body) then return nil, nil, "not_cc" end
 
   local sid = coding.session_id(body, kong.request.get_header(session_header))
   if not sid then return nil, nil, "no_session" end
@@ -150,11 +157,9 @@ local function build_request_events(conf, raw, session_header)
   return events, ctx, nil, preq
 end
 
--- returns events, ctx (response-side: PreToolUse)
 local function build_response_events(conf, raw, ctype, sid, user)
   local parsed
   if eventstream.is_eventstream(ctype) then
-    -- Bedrock InvokeModelWithResponseStream: unwrap binary frames -> Anthropic events
     local events = eventstream.decode_events(raw, cjson.decode, ngx.decode_base64)
     local assembled = sse.assemble_events(events, cjson.decode)
     parsed = coding.parse_response(assembled.content, assembled.stop_reason)
@@ -173,8 +178,21 @@ local function build_response_events(conf, raw, ctype, sid, user)
   return events, ctx, parsed
 end
 
+-- write the request-side serializer fields (bodies + meta) that file-log exports.
+local function serialize_request(conf, raw, sid)
+  kong.log.set_serialize_value("straiker.request_body", raw)
+  kong.log.set_serialize_value("straiker.request_bytes", #raw)
+  kong.log.set_serialize_value("straiker.session_id", sid)
+  kong.log.set_serialize_value("straiker.plugin", {
+    version = StraikerCoding.VERSION, mode = conf.mode, guardrails = "on",
+    -- how each synthesized event is sent to Straiker:
+    sent_to = conf.detect_url, method = "POST", x_tool = conf.x_tool,
+    signing = conf.sign_payloads and "HMAC-SHA256 over {timestamp}.{payload}" or "none",
+  })
+end
+
 -- ---------------------------------------------------------------------------
--- access: request-side events
+-- access: request-side events (PostToolUse, UserPromptSubmit)
 -- ---------------------------------------------------------------------------
 
 function StraikerCoding:access(conf)
@@ -185,58 +203,45 @@ function StraikerCoding:access(conf)
   local raw = read_request_body()
   if not raw then return end
 
-  -- raw-body capture ("what Kong sees") — gated on the X-Straiker-Capture header
-  if kong.request.get_header("X-Straiker-Capture") ~= nil then
-    local decoded = cjson.decode(raw)
-    local sid_cap = coding.session_id(type(decoded) == "table" and decoded or {},
-      kong.request.get_header(conf.session_header)) or kong.request.get_header(conf.session_header) or "unknown"
-    kong.ctx.plugin.capture = true
-    kong.ctx.plugin.capture_sid = sid_cap
-    -- stash a call id that persists into the response phase (ngx.var.request_id
-    -- differs between access and the buffered response phase, so pair on this).
-    kong.ctx.plugin.capture_cid = ngx.var.request_id
-    capture_write(sid_cap, {
-      ts = ngx.now(), phase = "request", rid = kong.ctx.plugin.capture_cid,
-      method = kong.request.get_method(),
-      path = kong.request.get_path_with_query(),
-      host = kong.request.get_header("host"),
-      content_type = kong.request.get_header("content-type"),
-      session_id = sid_cap,
-      body_bytes = #raw, body = raw,
-    })
-  end
-
   local ok, events, ctx, err, preq = pcall(build_request_events, conf, raw, conf.session_header)
   if not ok then
     kong.log.warn(LOG, " access build error (fail-open): ", tostring(events))
+    if conf.log_serialize then serialize_request(conf, raw, nil) end
     return
   end
   if not events or not ctx then
-    if conf.debug and err == "no_session" then kong.log.notice(LOG, " access: no session_id, skip") end
+    -- utility/title-gen or non-CC: still log the raw request Kong saw
+    if conf.log_serialize then
+      serialize_request(conf, raw, coding.session_id(cjson.decode(raw) or {}, kong.request.get_header(conf.session_header)))
+    end
     return
   end
 
   kong.ctx.plugin.sid = ctx.session_id
   kong.ctx.plugin.user = ctx.user_name
+  if conf.log_serialize then serialize_request(conf, raw, ctx.session_id) end
 
   if conf.debug then
     local types = {}
     for _, e in ipairs(events) do types[#types + 1] = e.hook_event_name end
     kong.log.notice(LOG, " access sid=", ctx.session_id, " kind=", preq and preq.kind,
-      " n_tools=", preq and preq.n_tools, " prompt=", (preq and preq.user_prompt or ""):sub(1, 40),
-      " tr=", preq and #preq.tool_results, " events=[", table.concat(types, ","), "]")
+      " n_tools=", preq and preq.n_tools, " tr=", preq and #preq.tool_results,
+      " events=[", table.concat(types, ","), "]")
   end
 
   for _, e in ipairs(events) do
     if first_time(ctx.session_id, evkey(e), 3600) then
       local ej = encode_event(e, ctx, conf)
       if conf.mode == "block" and e.hook_event_name == "PostToolUse" then
-        local deny, reason = post_enforce(conf, ej)
+        local deny, reason, verdict = post_enforce(conf, ej)
+        if conf.log_serialize then log_event(e, verdict, ej) end
         if deny then
           if conf.debug then kong.log.notice(LOG, " BLOCK PostToolUse ", e.tool_use_id) end
           return kong.response.exit(200, anthropic_block_body(reason),
             { ["Content-Type"] = "application/json" })
         end
+      elseif conf.log_serialize then
+        log_event(e, score_sync(conf, ej), ej)      -- sync score -> verdict in the log
       else
         post_async(conf, ej, e.hook_event_name, ctx.session_id)
       end
@@ -248,59 +253,78 @@ end
 -- response: response-side events (PreToolUse from the model's tool_use)
 -- ---------------------------------------------------------------------------
 
+local function finalize_response_log()
+  kong.log.set_serialize_value("straiker.events", kong.ctx.plugin.log_events or {})
+end
+
 function StraikerCoding:response(conf)
   local ctype = kong.response.get_header("Content-Type") or ""
 
-  -- raw-body capture ("what Kong sees") — runs for EVERY model call on the route
-  -- when capture is on, including utility/title-gen calls the plugin doesn't score.
-  if kong.ctx.plugin.capture then
+  -- log the raw response Kong returned for EVERY call on the route (incl. the
+  -- title-gen utility call the plugin doesn't score).
+  if conf.log_serialize then
     local craw = kong.response.get_raw_body()
     if craw then
-      local enc, payload = "raw", craw
       if eventstream.is_eventstream(ctype) then
-        enc = "base64"; payload = ngx.encode_base64(craw)
+        kong.log.set_serialize_value("straiker.response_body", ngx.encode_base64(craw))
+        kong.log.set_serialize_value("straiker.response_encoding", "base64")
+      else
+        kong.log.set_serialize_value("straiker.response_body", craw)
+        kong.log.set_serialize_value("straiker.response_encoding", "raw")
       end
-      capture_write(kong.ctx.plugin.capture_sid, {
-        ts = ngx.now(), phase = "response", rid = kong.ctx.plugin.capture_cid,
-        status = kong.response.get_status(),
-        content_type = ctype, body_bytes = #craw, encoding = enc, body = payload,
-      })
+      kong.log.set_serialize_value("straiker.response_bytes", #craw)
+      kong.log.set_serialize_value("straiker.response_content_type", ctype)
     end
   end
 
   local sid = kong.ctx.plugin.sid
-  if not sid then return end
+  if not sid then
+    if conf.log_serialize then finalize_response_log() end
+    return
+  end
 
   local raw = kong.response.get_raw_body()
-  if not raw or raw == "" then return end
+  if not raw or raw == "" then
+    if conf.log_serialize then finalize_response_log() end
+    return
+  end
 
   local ok, events, ctx, parsed = pcall(build_response_events, conf, raw, ctype, sid, kong.ctx.plugin.user)
   if not ok then
     kong.log.warn(LOG, " response build error (fail-open): ", tostring(events))
+    if conf.log_serialize then finalize_response_log() end
     return
   end
-  if not events then return end
+  if not events then
+    if conf.log_serialize then finalize_response_log() end
+    return
+  end
 
   if conf.debug then
-    kong.log.notice(LOG, " response sid=", sid, " sse=", tostring(sse.is_sse(ctype)),
-      " tool_uses=", parsed and #parsed.tool_uses or 0, " stop=", parsed and tostring(parsed.stop_reason))
+    kong.log.notice(LOG, " response sid=", sid, " tool_uses=", parsed and #parsed.tool_uses or 0,
+      " stop=", parsed and tostring(parsed.stop_reason))
   end
 
   for _, e in ipairs(events) do
     if e.hook_event_name == "PreToolUse" and first_time(sid, evkey(e), 3600) then
       local ej = encode_event(e, ctx, conf)
       if conf.mode == "block" then
-        local deny, reason = post_enforce(conf, ej)
+        local deny, reason, verdict = post_enforce(conf, ej)
+        if conf.log_serialize then log_event(e, verdict, ej) end
         if deny then
           if conf.debug then kong.log.notice(LOG, " BLOCK PreToolUse ", e.tool_name, " ", e.tool_use_id) end
           return kong.response.exit(200, anthropic_block_body(reason),
             { ["Content-Type"] = "application/json" })
         end
+      elseif conf.log_serialize then
+        log_event(e, score_sync(conf, ej), ej)
       else
         post_async(conf, ej, "PreToolUse", sid)
       end
     end
   end
+
+  if conf.log_serialize then finalize_response_log() end
 end
 
 return StraikerCoding

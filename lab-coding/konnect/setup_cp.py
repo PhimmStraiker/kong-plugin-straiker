@@ -44,7 +44,7 @@ def upsert_service(name, url):
     ex = find("services", name)
     body = {"name": name, "url": url}
     if ex:
-        c, d = req("PATCH", f"/core-entities/services/{ex['id']}", body)
+        c, d = req("PUT", f"/core-entities/services/{ex['id']}", body)
     else:
         c, d = req("POST", "/core-entities/services", body)
     print(f"  service {name}: {c}")
@@ -56,7 +56,7 @@ def upsert_route(name, service_id, paths):
     body = {"name": name, "paths": paths, "protocols": ["http", "https"],
             "strip_path": False, "service": {"id": service_id}}
     if ex:
-        c, d = req("PATCH", f"/core-entities/routes/{ex['id']}", body)
+        c, d = req("PUT", f"/core-entities/routes/{ex['id']}", body)
     else:
         c, d = req("POST", "/core-entities/routes", body)
     print(f"  route {name} {paths}: {c}")
@@ -73,12 +73,29 @@ def upsert_plugin(service_id, tag):
                       "mode": "monitor", "chatter_filter": True,
                       "session_header": "X-Straiker-Session-Id",
                       "user_name_default": "konnect-coding-demo",
+                      "log_serialize": True,   # export what Kong sees via file-log
                       "debug": True}}
     if ex:
-        c, d = req("PATCH", f"/core-entities/plugins/{ex['id']}", cfg)
+        c, d = req("PUT", f"/core-entities/plugins/{ex['id']}", cfg)
     else:
         c, d = req("POST", "/core-entities/plugins", cfg)
     print(f"  plugin straiker-coding on {tag}: {c}")
+    if c not in (200, 201):
+        print(f"    -> {json.dumps(d)[:400]}")
+
+
+def upsert_filelog(service_id, tag):
+    # Kong-native logging: write the full log serializer (incl. the straiker.*
+    # bodies/events/verdict the plugin adds) as JSONL to a mounted dir on the DP.
+    c, d = req("GET", f"/core-entities/services/{service_id}/plugins")
+    ex = next((p for p in d.get("data", []) if p.get("name") == "file-log"), None) if c == 200 else None
+    cfg = {"name": "file-log", "service": {"id": service_id},
+           "config": {"path": "/straiker-logs/kong.jsonl", "reopen": True}}
+    if ex:
+        c, d = req("PUT", f"/core-entities/plugins/{ex['id']}", cfg)
+    else:
+        c, d = req("POST", "/core-entities/plugins", cfg)
+    print(f"  plugin file-log on {tag}: {c}")
     if c not in (200, 201):
         print(f"    -> {json.dumps(d)[:400]}")
 
@@ -97,11 +114,13 @@ def main():
     s = upsert_service("anthropic-coding", "https://api.anthropic.com")
     upsert_route("anthropic-messages", s, ["/v1/messages"])
     upsert_plugin(s, "anthropic")
+    upsert_filelog(s, "anthropic")
 
     print("3. bedrock service/route/plugin")
     b = upsert_service("bedrock-coding", "https://bedrock-runtime.us-east-1.amazonaws.com")
     upsert_route("bedrock-invoke", b, ["/model"])
     upsert_plugin(b, "bedrock")
+    upsert_filelog(b, "bedrock")
 
     print("done.")
 

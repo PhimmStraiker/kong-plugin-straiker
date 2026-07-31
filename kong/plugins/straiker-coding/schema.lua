@@ -67,6 +67,14 @@ return {
           { debug = {
               type = "boolean", default = false,
           } },
+          { log_serialize = {
+              -- When true, enrich Kong's native log serializer with the raw
+              -- request/response bodies, the resolved session, the synthesized
+              -- hook events, and the real Straiker verdict (scored synchronously
+              -- so it lands in the same Kong log line). A Kong logging plugin
+              -- (file-log/http-log) then exports exactly what Kong saw + did.
+              type = "boolean", default = false,
+          } },
         },
     } },
   },

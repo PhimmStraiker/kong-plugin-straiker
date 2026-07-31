@@ -20,7 +20,13 @@ import json, os, urllib.request, urllib.error
 
 CP = os.environ["KONNECT_ADMIN_API"].rstrip("/")
 PAT = os.environ["KONNECT_PAT"]
-OVERRIDES = {"mode": "block", "fail_open": True, "debug": False}
+# Identity: Claude Code's wire traffic carries only a session UUID, not who the user is.
+# So attribute via (a) a per-request header the plugin reads -> per-developer identity, and
+# (b) a default that identifies the gateway owner when no header is present.
+USER_NAME = os.environ.get("STRAIKER_USER", "phimmasone@straiker.ai")
+OVERRIDES = {"mode": "block", "fail_open": True, "debug": False,
+             "user_name_header": "X-Straiker-User-Name",
+             "user_name_default": USER_NAME}
 
 
 def req(method, path, body=None):
@@ -71,7 +77,8 @@ def main():
     for p in all_coding_plugins():
         cf = p.get("config") or {}
         print(f"  {p['id'][:8]}: mode={cf.get('mode')} fail_open={cf.get('fail_open')} "
-              f"debug={cf.get('debug')} detect_url={cf.get('detect_url')}")
+              f"debug={cf.get('debug')} user_name_header={cf.get('user_name_header')} "
+              f"user_name_default={cf.get('user_name_default')}")
 
 
 if __name__ == "__main__":

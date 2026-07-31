@@ -9,6 +9,46 @@ Two things to set up, in this order:
 
 ---
 
+## What changes on your machine when you flip (and what doesn't)
+
+**The only client-side change is one environment variable.**
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:8000"   # Anthropic path — this is the whole flip
+# (Bedrock instead: CLAUDE_CODE_USE_BEDROCK=1 + ANTHROPIC_BEDROCK_BASE_URL=<kong>)
+```
+
+**What does NOT change** (nothing is written or migrated):
+- Your **login** — Claude Code sends your normal OAuth token; Kong forwards it to Anthropic,
+  which authenticates it. No API key needed. (Verified: a real prompt returned through Kong
+  on the live OAuth login.)
+- `~/.claude/` — settings, MCP servers, hooks, permissions, memory: **untouched**.
+- **Model, tools, agent behavior, your projects** — identical.
+- **Any already-running `claude` session** — the env var only affects **new** `claude`
+  processes started in a shell where it's set. Existing sessions keep going direct.
+
+**What changes in behavior** (the effects of routing through Kong):
+- **Path:** `Claude Code → Kong (localhost:8000) → Anthropic` — one extra local hop.
+- **Guardrails apply:** every turn/tool call is scored by Straiker. In **block** mode a deny
+  verdict blocks that request/tool. This is the point.
+- **Streaming → buffered:** the plugin buffers the response, so it arrives **complete rather
+  than token-by-token**. Functionally fine; the visible difference is a pause, then the whole
+  answer (no live streaming). This is the most noticeable UX change.
+- **Latency:** a modest per-call add for the sync detect (~tens–~100 ms); model time
+  dominates (a tiny prompt round-tripped in ~4–5 s).
+- **Depends on the Kong DP being up.** `fail_open` covers *Straiker* being unreachable — it
+  does **not** cover *Kong* being down. If the `straiker-konnect-dp` container is stopped
+  while the env var is set, Claude Code can't reach Anthropic. Fix = unset the var (rollback)
+  or start the container.
+- **Console visibility:** your real coding turns appear on the Straiker coding-agent card.
+
+**Rollback is total and instant** because nothing else changed:
+```bash
+unset ANTHROPIC_BASE_URL      # (or: kong-off, or just close that terminal)
+```
+
+---
+
 ## 1. Create a NEW guardrail profile in Kong — and use a Claude Code key
 
 **This path cannot run off the standard "API" key.** In Straiker there are two different
@@ -101,7 +141,21 @@ config:
   api_key:  <a Claude Code key>                            # NOT the standard API/collection key
   detect_url: https://<your-straiker>/api/v1/detect        # NOT /webhook
   x_tool:   claude-code
-  mode:     monitor        # start here; flip to "block" when you're ready
+  mode:      block         # plugin ENFORCES Straiker's verdict (monitor = observe only)
+  fail_open: true          # if Straiker is unreachable/times out -> ALLOW (never break coding)
+  debug:     false         # REQUIRED for enforcement: Straiker-Debug + block are mutually exclusive
+```
+
+**Enforcement posture (recommended for real use): `mode=block`, `fail_open=true`,
+`debug=false`.** The plugin then faithfully enforces whatever Straiker returns, allows on a
+guardrail outage, and — because `debug` is off — actually receives deny decisions (with
+`debug:true` the backend returns a score breakdown *instead of* the deny, so nothing blocks).
+**You drive the real block / detect / disable policy per category at the Straiker Console**;
+the plugin just enforces it. To flip the deployed plugin to this posture idempotently:
+
+```bash
+set -a && source .env.konnect && set +a
+python3 lab-coding/konnect/set_plugin_config.py     # sets mode=block, fail_open=true, debug=false
 ```
 
 Create it on Konnect with a **POST** (new profile), or **PUT** to update an existing one
@@ -152,6 +206,21 @@ kong-bedrock-on    # sets CLAUDE_CODE_USE_BEDROCK=1 + ANTHROPIC_BEDROCK_BASE_URL
 
 That's the whole flip. `kong-off` (or unsetting `ANTHROPIC_BASE_URL` /
 `ANTHROPIC_BEDROCK_BASE_URL`) puts you back to direct at any time.
+
+**Terminal vs. desktop GUI app.** The env-var flip applies to `claude` launched from **that
+shell** (any terminal — system Terminal, iTerm, the VS Code integrated terminal). It is
+per-process and fully isolated: other shells, other sessions, and the machine as a whole are
+untouched. A macOS **GUI** app does **not** inherit shell env vars, so to route the desktop
+app you'd set it at the login-session level and relaunch the app:
+
+```bash
+launchctl setenv ANTHROPIC_BASE_URL http://localhost:8000   # affects GUI apps; persists until unset/logout
+# rollback:
+launchctl unsetenv ANTHROPIC_BASE_URL                       # then relaunch the app
+```
+
+This is more global than the terminal path (it affects every GUI app that reads the var), so
+prefer the per-terminal flip unless you specifically need the desktop app routed.
 
 ---
 

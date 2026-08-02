@@ -1,0 +1,3 @@
+{"hook_event_name": "UserPromptSubmit", "prompt": "read README.md and summarize what this project does in two sentences"}
+{"hook_event_name": "PreToolUse", "tool_input": {"file_path": "/Users/phimmasonephonpaseuth/Projects/Straiker Projects/StraikerGateway/kong-plugin-straiker/README.md"}, "tool_name": "Read", "tool_use_id": "toolu_01T7mBxRz5foP5vC2iEUzGas"}
+{"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_use_id": "toolu_01T7mBxRz5foP5vC2iEUzGas"}

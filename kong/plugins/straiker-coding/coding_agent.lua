@@ -159,6 +159,24 @@ function M.parse_request(body, session_header)
     end
   end
 
+  -- tool_use_id -> tool name, recovered from the transcript.
+  -- The agentic loop resends the whole conversation every turn, so the assistant
+  -- tool_use block that a tool_result answers is always present in THIS request.
+  -- Recovering it here is what lets PostToolUse carry a tool_name: the response-side
+  -- map is built in a later phase and does not survive to the next request.
+  local call_names = {}
+  for i = 1, #msgs do
+    local m = msgs[i]
+    if type(m) == "table" and m.role == "assistant" and type(m.content) == "table" then
+      for _, blk in ipairs(m.content) do
+        if type(blk) == "table" and blk.type == "tool_use" and blk.id then
+          call_names[blk.id] = blk.name
+        end
+      end
+    end
+  end
+  res.call_names = call_names
+
   -- tool_results in the last user message → PostToolUse candidates
   if last_user and type(last_user.content) == "table" then
     for _, blk in ipairs(last_user.content) do
@@ -176,6 +194,7 @@ function M.parse_request(body, session_header)
         end
         res.tool_results[#res.tool_results + 1] = {
           tool_use_id = blk.tool_use_id,
+          name = blk.tool_use_id and res.call_names[blk.tool_use_id] or nil,
           content = ctext or "",
           is_error = blk.is_error and true or false,
         }
@@ -266,7 +285,9 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
     if tr.tool_use_id and not seen[dkey] then
       seen[dkey] = true
       local e = base("PostToolUse")
-      e.tool_name = ctx.tool_names and ctx.tool_names[tr.tool_use_id] or nil
+      -- prefer the name recovered from THIS request's transcript (always available);
+      -- fall back to the response-side map for same-request correlation.
+      e.tool_name = tr.name or (ctx.tool_names and ctx.tool_names[tr.tool_use_id]) or nil
       e.tool_response = tr.content
       e.tool_use_id = tr.tool_use_id
       e.is_error = tr.is_error

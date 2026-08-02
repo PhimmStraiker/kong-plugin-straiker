@@ -1,0 +1,7 @@
+{"hook_event_name": "UserPromptSubmit", "prompt": "search the whole project for the word token and list every file and line number where it appears"}
+{"hook_event_name": "PreToolUse", "tool_input": {"command": "grep -rn \"token\" . 2>/dev/null | head -500", "description": "Search recursively for \"token\" with line numbers"}, "tool_name": "Bash", "tool_use_id": "toolu_01Veack51D6TTCKt2kvrtNAy"}
+{"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_01Veack51D6TTCKt2kvrtNAy"}
+{"hook_event_name": "PreToolUse", "tool_input": {"command": "grep -rn \"token\" . 2>/dev/null | grep -v \"home/.claude\" | wc -l", "description": "Count token occurrences excluding Claude session files"}, "tool_name": "Bash", "tool_use_id": "toolu_011v1GwKThxjdVPQZ2RfHAHJ"}
+{"hook_event_name": "PreToolUse", "tool_input": {"command": "grep -rn \"token\" . 2>/dev/null | grep -v \"home/.claude\"", "description": "Show all token occurrences excluding session files"}, "tool_name": "Bash", "tool_use_id": "toolu_01JpQ1XQVB5t67k7Y8rwMgY8"}
+{"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_011v1GwKThxjdVPQZ2RfHAHJ"}
+{"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_01JpQ1XQVB5t67k7Y8rwMgY8"}

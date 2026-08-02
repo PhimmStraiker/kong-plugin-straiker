@@ -1,0 +1,5 @@
+{"hook_event_name": "UserPromptSubmit", "prompt": "create a new file called hello.py that prints hello world, then confirm it exists"}
+{"hook_event_name": "PreToolUse", "tool_input": {"content": "print(\"Hello, World!\")\n", "file_path": "/Users/phimmasonephonpaseuth/Projects/Straiker Projects/StraikerGateway/kong-plugin-straiker/lab-coding/out/corpus/ws-write_hello/hello.py"}, "tool_name": "Write", "tool_use_id": "toolu_01H83DjwHvf1mi87HNWkwe54"}
+{"hook_event_name": "PostToolUse", "tool_name": "Write", "tool_use_id": "toolu_01H83DjwHvf1mi87HNWkwe54"}
+{"hook_event_name": "PreToolUse", "tool_input": {"command": "ls -la hello.py", "description": "Verify hello.py exists"}, "tool_name": "Bash", "tool_use_id": "toolu_01MSuEsEMVrNSybnYAe9ErPc"}
+{"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "toolu_01MSuEsEMVrNSybnYAe9ErPc"}

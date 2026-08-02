@@ -35,6 +35,29 @@ return {
               type = "string", default = "monitor",
               one_of = { "monitor", "block" },
           } },
+          { enforcement = {
+              -- TRADEOFF (this is the streaming-vs-security switch):
+              --
+              -- "full"      Buffers the model response so a dangerous tool call can be
+              --             blocked BEFORE the client executes it. Blocks on the prompt
+              --             (kill switch), the tool call, and poisoned tool results.
+              --             COST: token streaming is lost — the user sees nothing until
+              --             the whole answer is ready. Measured: time-to-first-token
+              --             0.84s -> 18.7s on a 500-word answer (total time is unchanged;
+              --             only ~0.9s is real added latency).
+              --
+              -- "streaming" No response buffering, so native token streaming is preserved
+              --             (~0.8s to first token). Still blocks on the prompt (the kill
+              --             switch applies) and on poisoned tool results — both are
+              --             request-side and need no buffering. Tool calls are still
+              --             reported to Straiker for visibility, reconstructed from the
+              --             next request's transcript, but they are POST-HOC: the tool has
+              --             already run, so they cannot be blocked.
+              --
+              -- Pick "full" for enforcement, "streaming" for interactive comfort.
+              type = "string", default = "full",
+              one_of = { "full", "streaming" },
+          } },
           { chatter_filter = {
               -- Drop Claude Code utility/scaffolding calls (titlegen, suggestion
               -- mode, recap, quota, zero-tool turns) before emitting

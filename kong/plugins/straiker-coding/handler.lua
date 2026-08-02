@@ -22,7 +22,7 @@ local sse     = require "kong.plugins.straiker-coding.sse"
 local eventstream = require "kong.plugins.straiker-coding.eventstream"
 local detect  = require "kong.plugins.straiker-coding.detect"
 
-local StraikerCoding = { PRIORITY = 755, VERSION = "0.16.0" }
+local StraikerCoding = { PRIORITY = 755, VERSION = "0.17.0" }
 local LOG = "[straiker-coding]"
 
 -- ---------------------------------------------------------------------------
@@ -255,8 +255,13 @@ end
 
 function StraikerCoding:access(conf)
   kong.service.request.set_header("X-Forwarded-Proto", "https")
-  kong.service.request.enable_buffering()
-  kong.service.request.set_header("Accept-Encoding", "identity")
+  -- Buffering is what makes response-side (PreToolUse) blocking possible, and it is also
+  -- what destroys token streaming. Only pay for it when enforcement == "full".
+  local streaming = conf.enforcement == "streaming"
+  if not streaming then
+    kong.service.request.enable_buffering()
+    kong.service.request.set_header("Accept-Encoding", "identity")
+  end
 
   local raw = read_request_body()
   if not raw then return end
@@ -312,6 +317,26 @@ function StraikerCoding:access(conf)
       end
     end
   end
+
+  -- Streaming mode: the response phase never runs (nothing is buffered), so recover
+  -- PreToolUse telemetry from the transcript in THIS request. Monitor-only by
+  -- definition — the tool already ran on the client — but it keeps tool visibility in
+  -- the Console instead of going blind. Dedup by tool_use_id means each call is
+  -- reported once even though the transcript is resent every turn.
+  if streaming and preq and preq.prior_tool_uses then
+    for _, tu in ipairs(preq.prior_tool_uses) do
+      if tu.id and first_time(ctx.session_id, "pre:" .. tu.id, 3600) then
+        local e = { hook_event_name = "PreToolUse", session_id = ctx.session_id,
+                    user_name = ctx.user_name }
+        coding.fill_pre_tool_use(e, tu)
+        local ej = encode_event(e, ctx, conf)
+        if ej then
+          if conf.log_serialize then log_event(e, score_sync(conf, ej), ej)
+          else post_async(conf, ej, "PreToolUse", ctx.session_id) end
+        end
+      end
+    end
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -323,6 +348,10 @@ local function finalize_response_log()
 end
 
 function StraikerCoding:response(conf)
+  -- In streaming mode nothing was buffered, so there is no complete body to inspect;
+  -- PreToolUse telemetry was already emitted from the request transcript in access().
+  if conf.enforcement == "streaming" then return end
+
   local ctype = kong.response.get_header("Content-Type") or ""
 
   -- log the raw response Kong returned for EVERY call on the route (incl. the

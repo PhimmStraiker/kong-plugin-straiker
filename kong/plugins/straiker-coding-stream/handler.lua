@@ -40,8 +40,12 @@ local MAX_ACCUM = 8 * 1024 * 1024
 
 function StraikerCodingStream:access(conf)
   kong.service.request.set_header("X-Forwarded-Proto", "https")
-  -- NO enable_buffering() and NO Accept-Encoding override: the response streams through
-  -- untouched, which is the entire point of this variant.
+  -- NO enable_buffering() — that is the entire point of this variant.
+  -- Accept-Encoding: identity IS still required. Without buffering Kong does not
+  -- decompress, so body_filter would receive gzipped bytes and the SSE assembler would
+  -- silently parse nothing (observed: tool_uses=0 / stop=nil on turns that definitely
+  -- called a tool). Forcing identity costs nothing here and does not affect streaming.
+  kong.service.request.set_header("Accept-Encoding", "identity")
 
   local raw = core.read_request_body()
   if not raw then return end

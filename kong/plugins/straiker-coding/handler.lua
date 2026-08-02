@@ -350,6 +350,8 @@ end
 function StraikerCoding:response(conf)
   -- In streaming mode nothing was buffered, so there is no complete body to inspect;
   -- PreToolUse telemetry was already emitted from the request transcript in access().
+  -- NOTE: streaming is not selectable (see schema) — Kong forces buffering whenever a
+  -- plugin implements :response(). Kept as a guard for the future body_filter rewrite.
   if conf.enforcement == "streaming" then return end
 
   local ctype = kong.response.get_header("Content-Type") or ""

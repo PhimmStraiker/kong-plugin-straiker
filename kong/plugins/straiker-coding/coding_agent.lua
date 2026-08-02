@@ -192,13 +192,14 @@ function M.parse_request(body, session_header)
   -- tool_use block that a tool_result answers is always present in THIS request.
   -- Recovering it here is what lets PostToolUse carry a tool_name: the response-side
   -- map is built in a later phase and does not survive to the next request.
-  local call_names, prior_tool_uses = {}, {}
+  local call_names, call_inputs, prior_tool_uses = {}, {}, {}
   for i = 1, #msgs do
     local m = msgs[i]
     if type(m) == "table" and m.role == "assistant" and type(m.content) == "table" then
       for _, blk in ipairs(m.content) do
         if type(blk) == "table" and blk.type == "tool_use" and blk.id then
           call_names[blk.id] = blk.name
+          call_inputs[blk.id] = blk.input
           -- Keep the full call so streaming mode can still emit PreToolUse telemetry
           -- without buffering the response: the transcript is resent every turn, so the
           -- assistant's tool calls are recoverable from the REQUEST. Post-hoc (the tool
@@ -209,6 +210,7 @@ function M.parse_request(body, session_header)
     end
   end
   res.call_names = call_names
+  res.call_inputs = call_inputs
   res.prior_tool_uses = prior_tool_uses
 
   -- tool_results in the last user message → PostToolUse candidates
@@ -229,6 +231,7 @@ function M.parse_request(body, session_header)
         res.tool_results[#res.tool_results + 1] = {
           tool_use_id = blk.tool_use_id,
           name = blk.tool_use_id and res.call_names[blk.tool_use_id] or nil,
+          input = blk.tool_use_id and res.call_inputs[blk.tool_use_id] or nil,
           content = ctext or "",
           -- a tool can RETURN an attachment (Read on an image); without this the
           -- tool_response is just "" and the Console shows nothing happened
@@ -271,8 +274,9 @@ end
 
 -- content = array of blocks from the assistant message (text / tool_use).
 -- Returns { tool_uses = { {id,name,input}, ... }, text = "...", stop_reason }
-function M.parse_response(content, stop_reason)
-  local out = { tool_uses = {}, text = nil, stop_reason = stop_reason }
+function M.parse_response(content, stop_reason, meta)
+  local out = { tool_uses = {}, text = nil, stop_reason = stop_reason,
+                model = meta and meta.model, usage = meta and meta.usage }
   local text_parts = {}
   if type(content) == "table" then
     for _, blk in ipairs(content) do
@@ -353,6 +357,10 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
       -- fall back to the response-side map for same-request correlation.
       e.tool_name = tr.name or (ctx.tool_names and ctx.tool_names[tr.tool_use_id]) or nil
       e.tool_response = tr.content
+      -- The backend derives the IPI file path from tool_input (hook_dispatcher.py:105-108);
+      -- without it, findings are stored under the literal tool name ("Read") and
+      -- ipi_file_path is "". The transcript still holds the original call's arguments.
+      e.tool_input = tr.input
       e.tool_use_id = tr.tool_use_id
       if tr.attachments then e.attachments = tr.attachments end
       e.is_error = tr.is_error
@@ -398,6 +406,14 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
         local e = base("Stop")
         e.app_response = parsed_resp.text
         e.stop_reason = parsed_resp.stop_reason
+        -- Real model id and token usage, read off the wire. The backend currently
+        -- hardcodes model="claude" and stores no usage at all, so this is the only
+        -- source for per-developer spend and "someone is using an unapproved model".
+        e.model = parsed_resp.model
+        if parsed_resp.usage then
+          e.input_tokens = parsed_resp.usage.input_tokens
+          e.output_tokens = parsed_resp.usage.output_tokens
+        end
         events[#events + 1] = e
       end
     end

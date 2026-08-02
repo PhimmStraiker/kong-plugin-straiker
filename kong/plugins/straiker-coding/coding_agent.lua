@@ -246,7 +246,8 @@ function M.parse_response(content, stop_reason)
     for _, blk in ipairs(content) do
       if type(blk) == "table" then
         if blk.type == "tool_use" then
-          out.tool_uses[#out.tool_uses + 1] = { id = blk.id, name = blk.name, input = blk.input }
+          out.tool_uses[#out.tool_uses + 1] = { id = blk.id, name = blk.name, input = blk.input,
+                                                input_json = blk.input_json, input_ok = blk.input_ok }
         elseif blk.type == "text" and type(blk.text) == "string" then
           text_parts[#text_parts + 1] = blk.text
         end
@@ -278,6 +279,14 @@ function M.fill_pre_tool_use(e, tu)
   e.tool_name = tu.name
   e.tool_input = hook_tool_input(tu.name, tu.input)
   e.tool_use_id = tu.id
+  -- Surface unparseable tool arguments explicitly. tool_input already carries the raw
+  -- text (as _unparsed_arguments) so Straiker can still scan the command; this flag lets
+  -- the backend/Console treat "arguments did not parse" as a signal in its own right
+  -- rather than seeing a tool call with suspiciously empty input.
+  if tu.input_ok == false then
+    e.tool_input_unparsed = true
+    e.tool_input_raw = tu.input_json
+  end
   -- MCP passthrough. Claude Code names MCP tools mcp__<server>__<tool> (the server key
   -- can itself contain single underscores; the delimiter is the double underscore).
   if type(tu.name) == "string" and tu.name:match("^mcp__") then

@@ -9,6 +9,7 @@ USER root
 # bake the plugins into the image
 COPY kong/plugins/straiker        /usr/local/share/lua/5.1/kong/plugins/straiker
 COPY kong/plugins/straiker-coding /usr/local/share/lua/5.1/kong/plugins/straiker-coding
+COPY kong/plugins/straiker-coding-stream /usr/local/share/lua/5.1/kong/plugins/straiker-coding-stream
 COPY shared-gateway/apprunner/entrypoint.sh /entrypoint-konggw.sh
 RUN chmod +x /entrypoint-konggw.sh
 

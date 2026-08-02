@@ -15,16 +15,19 @@ function M.assemble_events(events, decode)
       local t = ev.type
       if t == "content_block_start" then
         local cb = ev.content_block or {}
+        -- Accumulate into TABLES, not by string concat. A long answer arrives as
+        -- thousands of deltas; `s = s .. d` reallocates the whole string every time
+        -- (O(n^2) bytes copied). table.concat at the end is linear.
         blocks[ev.index] = { type = cb.type, id = cb.id, name = cb.name,
-                             text = cb.text or "", _json = "" }
+                             text_parts = { cb.text or "" }, json_parts = {} }
       elseif t == "content_block_delta" then
         local b = blocks[ev.index]
         local d = ev.delta or {}
         if b then
           if d.type == "text_delta" then
-            b.text = (b.text or "") .. (d.text or "")
+            b.text_parts[#b.text_parts + 1] = d.text or ""
           elseif d.type == "input_json_delta" then
-            b._json = (b._json or "") .. (d.partial_json or "")
+            b.json_parts[#b.json_parts + 1] = d.partial_json or ""
           end
         end
       elseif t == "message_delta" then
@@ -42,14 +45,26 @@ function M.assemble_events(events, decode)
   for _, i in ipairs(idxs) do
     local b = blocks[i]
     if b.type == "tool_use" then
-      local input = {}
-      if b._json and b._json ~= "" then
-        local v = decode(b._json)
-        if type(v) == "table" then input = v end
+      local raw_json = table.concat(b.json_parts)
+      local input, input_ok = {}, true
+      if raw_json ~= "" then
+        local v = decode(raw_json)
+        if type(v) == "table" then
+          input = v
+        else
+          -- SECURITY: the arguments did not parse (truncated stream, or deliberately
+          -- malformed). Previously `input` stayed {} and raw_json was DISCARDED, so the
+          -- tool call reached Straiker with empty arguments — nothing to score — and was
+          -- allowed. Keep the raw text so the actual command is still scanned, and flag
+          -- it so callers can treat unparseable arguments as suspicious rather than empty.
+          input_ok = false
+          input = { _unparsed_arguments = raw_json }
+        end
       end
-      content[#content + 1] = { type = "tool_use", id = b.id, name = b.name, input = input }
+      content[#content + 1] = { type = "tool_use", id = b.id, name = b.name,
+                                input = input, input_json = raw_json, input_ok = input_ok }
     elseif b.type == "text" then
-      content[#content + 1] = { type = "text", text = b.text }
+      content[#content + 1] = { type = "text", text = table.concat(b.text_parts) }
     end
   end
   return { content = content, stop_reason = stop_reason }

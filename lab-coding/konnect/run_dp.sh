@@ -31,7 +31,7 @@ docker run -d --name straiker-konnect-dp \
   -e "KONG_CLUSTER_CERT=/kong/tls.crt" \
   -e "KONG_CLUSTER_CERT_KEY=/kong/tls.key" \
   -e "KONG_LUA_SSL_TRUSTED_CERTIFICATE=system" \
-  -e "KONG_PLUGINS=bundled,straiker,straiker-coding" \
+  -e "KONG_PLUGINS=bundled,straiker,straiker-coding,straiker-coding-stream" \
   -e "KONG_NGINX_HTTP_LUA_SHARED_DICT=straiker_coding 32m" \
   -e "KONG_NGINX_HTTP_CLIENT_BODY_BUFFER_SIZE=16m" \
   -e "KONG_NGINX_HTTP_CLIENT_MAX_BODY_SIZE=0" \
@@ -40,6 +40,7 @@ docker run -d --name straiker-konnect-dp \
   -e "KONG_LOG_LEVEL=notice" \
   -v "$REPO/kong/plugins/straiker:/usr/local/share/lua/5.1/kong/plugins/straiker:ro" \
   -v "$REPO/kong/plugins/straiker-coding:/usr/local/share/lua/5.1/kong/plugins/straiker-coding:ro" \
+  -v "$REPO/kong/plugins/straiker-coding-stream:/usr/local/share/lua/5.1/kong/plugins/straiker-coding-stream:ro" \
   -v "$TLS/logs:/straiker-logs" \
   -v "$TLS/tls.crt:/kong/tls.crt:ro" \
   -v "$TLS/tls.key:/kong/tls.key:ro" \

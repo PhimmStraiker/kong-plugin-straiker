@@ -18,6 +18,7 @@
 -- kong.response.exit (the block action) is only ever invoked OUTSIDE pcall.
 local cjson   = require "cjson.safe"
 local coding  = require "kong.plugins.straiker-coding.coding_agent"
+local dialects = require "kong.plugins.straiker-coding.dialects"
 local sse     = require "kong.plugins.straiker-coding.sse"
 local eventstream = require "kong.plugins.straiker-coding.eventstream"
 local detect  = require "kong.plugins.straiker-coding.detect"
@@ -267,13 +268,25 @@ end
 local function build_request_events(conf, raw, session_header)
   local body = cjson.decode(raw)
   if type(body) ~= "table" then return nil end
-  if conf.agent ~= "off" and not coding.is_claude_code(body) then return nil, nil, "not_cc" end
-
-  local sid = coding.session_id(body, kong.request.get_header(session_header))
-  if not sid then return nil, nil, "no_session" end
+  -- Claude Code (Anthropic Messages) is handled natively. Anything else goes through the
+  -- dialect layer, which normalizes OpenAI Chat / Responses into the SAME shape so all
+  -- agents produce identical hook events downstream.
+  local preq, sid
+  if conf.agent == "off" or coding.is_claude_code(body) then
+    sid = coding.session_id(body, kong.request.get_header(session_header))
+    if not sid then return nil, nil, "no_session" end
+    preq = coding.parse_request(body, kong.request.get_header(session_header))
+  else
+    -- these agents put the session in REQUEST HEADERS, not the body
+    local hsid = dialects.session_id_from_headers(function(h) return kong.request.get_header(h) end)
+             or kong.request.get_header(session_header)
+    preq = dialects.parse_request(body, cjson.decode, hsid)
+    if not preq then return nil, nil, "not_cc" end
+    sid = preq.session_id
+    if not sid then return nil, nil, "no_session" end
+  end
 
   local ctx = { session_id = sid, user_name = resolve_user(conf) }
-  local preq = coding.parse_request(body, kong.request.get_header(session_header))
   if conf.chatter_filter == false then preq.kind = "turn" end
 
   local events = coding.to_hook_events(preq, nil, ctx)

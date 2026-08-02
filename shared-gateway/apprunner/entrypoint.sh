@@ -17,5 +17,6 @@ if [ -n "${KONG_CLUSTER_CERT_KEY_B64:-}" ]; then
   export KONG_CLUSTER_CERT_KEY="$CERT_DIR/tls.key"
 fi
 
-# hand off to the stock Kong entrypoint (data_plane role comes from KONG_ROLE env)
-exec /docker-entrypoint.sh kong docker-start
+# hand off to the stock Kong entrypoint (data_plane role comes from KONG_ROLE env).
+# NB: in kong/kong-gateway:3.x this is /entrypoint.sh (NOT /docker-entrypoint.sh).
+exec /entrypoint.sh kong docker-start

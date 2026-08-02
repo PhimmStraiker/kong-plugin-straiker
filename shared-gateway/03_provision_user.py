@@ -46,7 +46,7 @@ def add(email):
     print(f"  identity : {email}")
     print(f"  key      : {key}")
     print(f"  base URL : {GW}")
-    print( "  setup    : export STRAIKER_KEY='%s'; source konggw-toggle.sh; konggw-on" % key)
+    print( "  setup    : export KONGGW_KEY='%s'; source konggw-toggle.sh; konggw-on" % key)
 
 def revoke(email):
     ex = find_consumer(email)

@@ -65,7 +65,7 @@ python3 03_provision_user.py revoke alice@straiker.ai
 
 ## What a teammate does (once)
 ```bash
-export STRAIKER_KEY='<key from you>'
+export KONGGW_KEY='<key from you>'
 source konggw-toggle.sh
 konggw-on            # or konggw-bedrock-on (needs their own AWS_BEARER_TOKEN_BEDROCK)
 # … use Claude Code normally …

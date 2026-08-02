@@ -35,9 +35,13 @@ TARGET=$(echo "$JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["
 echo "  DNSTarget: $TARGET  (validation records: $N)"
 
 echo "== build Route53 change batch =="
-BATCH=$(echo "$JSON" | python3 - "$DOMAIN" "$TARGET" <<'PY'
+# NB: pass the JSON via a FILE, not a pipe — a heredoc script replaces stdin, so
+# json.load(sys.stdin) would read the (already consumed) script instead of the data.
+JSON_FILE="$(mktemp)"; printf '%s' "$JSON" > "$JSON_FILE"
+BATCH=$(python3 - "$DOMAIN" "$TARGET" "$JSON_FILE" <<'PY'
 import json,sys
-d=json.load(sys.stdin); domain,target=sys.argv[1],sys.argv[2]
+domain,target=sys.argv[1],sys.argv[2]
+d=json.load(open(sys.argv[3]))
 ch=[{"Action":"UPSERT","ResourceRecordSet":{"Name":domain,"Type":"CNAME","TTL":300,
      "ResourceRecords":[{"Value":target}]}}]
 seen=set()
@@ -64,7 +68,7 @@ for i in $(seq 1 60); do
   ST=$(aws apprunner describe-custom-domains --service-arn "$ARN" --region "$REGION" \
         --query "CustomDomains[?DomainName=='$DOMAIN'].Status" --output text)
   echo "  status: $ST"
-  [ "$ST" = "ACTIVE" ] && { echo "DONE -> https://$DOMAIN"; exit 0; }
+  [ "$(echo "$ST" | tr "[:upper:]" "[:lower:]")" = "active" ] && { echo "DONE -> https://$DOMAIN"; exit 0; }
   sleep 20
 done
 echo "still pending; re-run this script or check the console."

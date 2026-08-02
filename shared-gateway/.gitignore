@@ -2,3 +2,4 @@ secrets/
 cp.env
 *.env.local
 apprunner/out/
+agent-keys.env

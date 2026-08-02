@@ -20,3 +20,7 @@ lab-coding/out/
 lab-coding/kong/out/
 lab-coding/**/ws-*/
 lab-coding/konnect/out/
+err.txt
+lab-coding/err.txt
+lab-coding/resp.txt
+shared-gateway/apprunner/*.log

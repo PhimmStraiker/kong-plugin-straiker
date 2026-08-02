@@ -28,9 +28,27 @@ def req(method, path, body=None):
         try: return e.code, json.loads(raw)
         except Exception: return e.code, {"raw": raw[:300].decode()}
 
+def all_consumers():
+    """List every consumer, following pagination.
+
+    NB: Konnect IGNORES ?username= — it returns the full list regardless — so filtering
+    must happen client-side over ALL pages. Relying on the query param silently returned
+    the wrong answer and left a revoked user's key live.
+    """
+    out, offset = [], None
+    while True:
+        c, d = req("GET", "/consumers?size=100" + (f"&offset={offset}" if offset else ""))
+        if c != 200:
+            break
+        out += d.get("data", [])
+        offset = d.get("offset")
+        if not offset:
+            break
+    return out
+
+
 def find_consumer(username):
-    c, d = req("GET", f"/consumers?username={username}")
-    return next((x for x in d.get("data", []) if x.get("username") == username), None) if c == 200 else None
+    return next((x for x in all_consumers() if x.get("username") == username), None)
 
 def add(email):
     ex = find_consumer(email)

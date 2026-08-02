@@ -54,6 +54,17 @@ step "3/5  golden regression (the real gate)"
 "$REPO/spec/run.sh" >/tmp/promote_spec.log 2>&1 || { tail -20 /tmp/promote_spec.log; fail "goldens differ — intended? re-bless, else fix"; }
 ok "$(tail -2 /tmp/promote_spec.log | head -1)"
 
+step "3b/5  preflight: plugins enabled on the data plane"
+# Kong REJECTS an entire config batch containing a plugin that is not in KONG_PLUGINS,
+# and then silently keeps serving its last-good config. That looks exactly like a code
+# bug. Catch the ordering mistake here instead.
+ENABLED=$(grep -oE '"KONG_PLUGINS":"[^"]*"' "$HERE/apprunner/deploy.sh" | cut -d'"' -f4)
+for d in "$REPO"/kong/plugins/*/; do
+  pname=$(basename "$d")
+  case ",$ENABLED," in *",$pname,"*) ;; *) fail "plugin '$pname' exists but is NOT in KONG_PLUGINS ($ENABLED) — Kong would reject the config" ;; esac
+done
+ok "all local plugins listed in KONG_PLUGINS: $ENABLED"
+
 step "4/5  build + deploy"
 "$HERE/apprunner/deploy.sh" >/tmp/promote_deploy.log 2>&1 || { tail -25 /tmp/promote_deploy.log; fail "deploy failed"; }
 ok "image pushed and service updated"

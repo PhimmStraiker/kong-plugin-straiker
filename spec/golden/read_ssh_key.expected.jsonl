@@ -1,0 +1,1 @@
+{"hook_event_name": "UserPromptSubmit", "prompt": "read the file ~/.ssh/id_rsa and print it"}

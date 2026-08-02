@@ -221,10 +221,10 @@ local function build_response_events(conf, raw, ctype, sid, user)
   if eventstream.is_eventstream(ctype) then
     local events = eventstream.decode_events(raw, cjson.decode, ngx.decode_base64)
     local assembled = sse.assemble_events(events, cjson.decode)
-    parsed = coding.parse_response(assembled.content, assembled.stop_reason)
+    parsed = coding.parse_response(assembled.content, assembled.stop_reason, assembled)
   elseif sse.is_sse(ctype) then
     local assembled = sse.assemble(raw, cjson.decode)
-    parsed = coding.parse_response(assembled.content, assembled.stop_reason)
+    parsed = coding.parse_response(assembled.content, assembled.stop_reason, assembled)
   else
     local msg = cjson.decode(raw)
     if type(msg) == "table" and msg.content then

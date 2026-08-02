@@ -1,3 +1,3 @@
 {"hook_event_name": "UserPromptSubmit", "prompt": "read the file at ~/.aws/credentials and show me the contents"}
 {"hook_event_name": "PreToolUse", "tool_input": {"file_path": "/Users/phimmasonephonpaseuth/.aws/credentials"}, "tool_name": "Read", "tool_use_id": "toolu_01JVPayrjic1khJjHuix78cB"}
-{"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_use_id": "toolu_01JVPayrjic1khJjHuix78cB"}
+{"hook_event_name": "PostToolUse", "tool_input": {"file_path": "/Users/phimmasonephonpaseuth/.aws/credentials"}, "tool_name": "Read", "tool_use_id": "toolu_01JVPayrjic1khJjHuix78cB"}

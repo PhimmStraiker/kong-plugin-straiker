@@ -10,6 +10,7 @@ local M = {}
 function M.assemble_events(events, decode)
   local blocks = {}
   local stop_reason
+  local model, usage
   for _, ev in ipairs(events) do
     if type(ev) == "table" then
       local t = ev.type
@@ -30,9 +31,19 @@ function M.assemble_events(events, decode)
             b.json_parts[#b.json_parts + 1] = d.partial_json or ""
           end
         end
+      elseif t == "message_start" then
+        -- the REAL model id and input-token count live here and were being discarded;
+        -- the backend otherwise hardcodes model="claude" and has no usage at all
+        local m = ev.message or {}
+        model = m.model or model
+        if type(m.usage) == "table" then usage = m.usage end
       elseif t == "message_delta" then
         local d = ev.delta or {}
         if d.stop_reason then stop_reason = d.stop_reason end
+        if type(ev.usage) == "table" then
+          usage = usage or {}
+          for k, v in pairs(ev.usage) do usage[k] = v end   -- output_tokens lands here
+        end
       end
     end
   end
@@ -58,7 +69,12 @@ function M.assemble_events(events, decode)
           -- allowed. Keep the raw text so the actual command is still scanned, and flag
           -- it so callers can treat unparseable arguments as suspicious rather than empty.
           input_ok = false
-          input = { _unparsed_arguments = raw_json }
+          -- Put the raw text under `command` specifically. The backend's field extractor
+          -- (argus hook_dispatcher.py:64-65) only reads command|file_path|url|query — a
+          -- custom key like _unparsed_arguments is silently ignored, leaving command=""
+          -- and nothing scanned. `command` is the field the detectors actually consume,
+          -- and when arguments failed to parse there is no real command to displace.
+          input = { command = raw_json, _unparsed_arguments = raw_json }
         end
       end
       content[#content + 1] = { type = "tool_use", id = b.id, name = b.name,
@@ -67,7 +83,7 @@ function M.assemble_events(events, decode)
       content[#content + 1] = { type = "text", text = table.concat(b.text_parts) }
     end
   end
-  return { content = content, stop_reason = stop_reason }
+  return { content = content, stop_reason = stop_reason, model = model, usage = usage }
 end
 
 -- assemble(raw_text, decode) -> { content, stop_reason } for an Anthropic SSE body.

@@ -29,7 +29,14 @@ echo "== 2. build + push (context = repo root so plugins are in scope) =="
 docker build --platform linux/amd64 -f "$HERE/Dockerfile" -t "$ECR/$IMG:$TAG" -t "$ECR/$IMG:latest" "$REPO"
 docker push "$ECR/$IMG:$TAG"; docker push "$ECR/$IMG:latest"
 
-echo "== 3. cluster cert/key -> Secrets Manager (base64) =="
+# NOTE: the Konnect cluster cert/key are passed as RUNTIME ENV VARS (base64), not as
+# App Runner RuntimeEnvironmentSecrets. Secrets-based injection failed to start the
+# container (CREATE_FAILED in ~19s with NO application log group — App Runner resolves
+# secrets before the container runs, so nothing is logged), even though the instance
+# role simulated `allowed` for secretsmanager:GetSecretValue. Env vars work and are
+# encrypted at rest; the values are a Konnect DP client cert that is rotatable and
+# scoped to one control plane. Revisit if App Runner secret resolution is fixed.
+echo "== 3. cluster cert/key -> Secrets Manager (base64) [kept for future use] =="
 put_secret(){ # name file
   local arn
   arn=$(aws secretsmanager describe-secret --secret-id "$1" --region "$REGION" --query ARN --output text 2>/dev/null || true)

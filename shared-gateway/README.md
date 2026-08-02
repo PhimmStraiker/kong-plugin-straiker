@@ -1,8 +1,31 @@
-# Straiker shared Claude Code gateway (`konggw.dev.straiker.ai`)
+# Straiker shared Claude Code gateway — **LIVE at `https://konggw.dev.straiker.ai`**
 
 One hosted, Straiker-guardrailed endpoint the whole team points `ANTHROPIC_BASE_URL` at —
 no per-person local proxy. Internet-reachable but **key-auth gated to Straiker folks**, on
 its **own** Konnect control plane (`straiker-shared-kong-gateway`), separate from SE demo.
+
+**Status: verified end-to-end.** Real Claude Code through the gateway returns normally
+(~5 s for a one-line prompt); `no key` → Kong `"No API key found in request"`; a valid key
+forwards upstream to Anthropic.
+
+## Why we self-host the data plane (and don't use Kong's SaaS gateways)
+
+Kong Konnect *does* offer hosted data planes, and **Dedicated Cloud Gateways even support
+custom Lua plugins** ("Custom Plugin Streaming" — you upload `handler.lua`/`schema.lua` and
+Konnect distributes them). **Serverless Gateways explicitly do not.** We still self-host,
+because `straiker-coding` cannot run on a DCG as written:
+
+| Need | On Dedicated Cloud Gateways |
+|---|---|
+| `lua_shared_dict straiker_coding 32m` (cross-request dedup) | ❌ `ngx.shared` isn't in the sandbox allowlist, and `KONG_NGINX_HTTP_*` injection is "Incompatible with: konnect" |
+| `ngx.timer.at` (async detect posting) | ❌ custom plugins "cannot… create timers" |
+| 6 Lua modules | ❌ exactly one `handler.lua` + one `schema.lua`, ≤100 KB, no custom modules |
+| `resty.http` | ⚠️ requires `KONG_UNTRUSTED_LUA=lax` |
+| `resty.openssl.hmac`, `enable_buffering()` | ✅ allowed |
+
+The shared dict is load-bearing: without it the agentic loop's resent transcript is
+re-scored every turn. So Kong hosts the **control plane**; we host the **data plane** on
+App Runner and supply the URL.
 
 ```
 teammate (Claude Code, own login)          konggw.dev.straiker.ai (App Runner)

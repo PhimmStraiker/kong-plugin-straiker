@@ -22,7 +22,7 @@ local sse     = require "kong.plugins.straiker-coding.sse"
 local eventstream = require "kong.plugins.straiker-coding.eventstream"
 local detect  = require "kong.plugins.straiker-coding.detect"
 
-local StraikerCoding = { PRIORITY = 755, VERSION = "0.15.0" }
+local StraikerCoding = { PRIORITY = 755, VERSION = "0.16.0" }
 local LOG = "[straiker-coding]"
 
 -- ---------------------------------------------------------------------------
@@ -59,8 +59,14 @@ local function evkey(e)
 end
 
 local function resolve_user(conf)
+  -- 1) an authenticated Kong consumer (e.g. key-auth on the shared gateway) IS the identity
+  local get_consumer = kong.client and kong.client.get_consumer
+  local consumer = get_consumer and get_consumer()
+  if consumer and consumer.username and consumer.username ~= "" then return consumer.username end
+  -- 2) else an identity header the client injects (local toggle: X-Straiker-User-Name)
   local h = conf.user_name_header and kong.request.get_header(conf.user_name_header)
   if h and h ~= "" then return h end
+  -- 3) else the configured default
   return conf.user_name_default or "kong-coding"
 end
 

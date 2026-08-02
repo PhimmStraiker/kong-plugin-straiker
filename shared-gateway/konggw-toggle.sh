@@ -7,7 +7,7 @@
 # shared gateway, which applies Straiker guardrails and forwards to Anthropic/Bedrock.
 # Your identity in the Straiker Console comes from your key (no extra setup).
 
-KONGGW_URL="${KONGGW_URL:-https://yamxf549ty.us-east-1.awsapprunner.com}"
+KONGGW_URL="${KONGGW_URL:-https://konggw.dev.straiker.ai}"
 
 konggw-on() {          # Claude Code -> shared gateway -> Anthropic (guardrails ON)
   if [ -z "${STRAIKER_KEY:-}" ]; then echo "set STRAIKER_KEY='<your key>' first"; return 1; fi

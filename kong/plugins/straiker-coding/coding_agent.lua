@@ -178,6 +178,8 @@ function M.parse_request(body, session_header)
 
   local tools = type(body.tools) == "table" and body.tools or {}
   res.n_tools = #tools
+  res.stream = body.stream == true
+  res.model = body.model
 
   local msgs = type(body.messages) == "table" and body.messages or {}
   local last_user
@@ -256,7 +258,20 @@ function M.parse_request(body, session_header)
   -- utility calls (titlegen, suggestion, recap, quota) carry zero.
   local reason
   if res.n_tools == 0 then
-    reason = "no_tools_utility"
+    -- A zero-tool turn is the structural signature of Claude Code's utility calls
+    -- (titlegen, suggestion, recap) — but treating EVERY zero-tool turn as chatter made
+    -- `claude -p --allowedTools "" "<prompt>"` a completely unmonitored channel. Require
+    -- a corroborating scaffolding marker, or that the turn carry no real user text, so a
+    -- genuine prompt sent without tools is still scored.
+    local hay0 = lower(res.user_prompt or "")
+    for _, m in ipairs(CHATTER_MARKERS) do
+      if hay0:find(m, 1, true) then reason = "marker:" .. m; break end
+    end
+    if not reason and hay0 == "" then
+      -- no scaffolding marker AND no user text: genuinely a utility call
+      reason = "no_tools_no_prompt"
+    end
+    -- otherwise: a real prompt sent with tools disabled. Score it.
   else
     local hay = lower(prompt or "")
     for _, m in ipairs(CHATTER_MARKERS) do
@@ -398,7 +413,12 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
     -- NOT carry this (a known coding-agent limitation) — but the gateway sees
     -- the response on the wire, so it can capture and forward the model's final
     -- output (enables output-side guardrails the endpoint hook cannot provide).
-    if parsed_resp.stop_reason == "end_turn"
+    -- Fire on ANY terminal stop_reason. Gating on end_turn alone lost output telemetry
+    -- for max_tokens and stop_sequence endings — i.e. the LONGEST answers, which are
+    -- exactly the ones worth scanning for leaked secrets/PII. (tool_use is NOT terminal:
+    -- the turn continues, and PreToolUse already covers it.)
+    local sr = parsed_resp.stop_reason
+    if (sr == "end_turn" or sr == "max_tokens" or sr == "stop_sequence")
        and type(parsed_resp.text) == "string" and parsed_resp.text ~= "" then
       local dkey = "stop:" .. parsed_resp.text:sub(1, 96)
       if not seen[dkey] then

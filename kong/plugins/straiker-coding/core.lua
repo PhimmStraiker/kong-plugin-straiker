@@ -43,11 +43,47 @@ local function read_request_body()
 end
 
 -- cross-request dedup (the agentic loop resends the whole transcript each call).
-local function first_time(sid, dkey, ttl)
+--
+-- FAILURE SEMANTICS MATTER HERE. dict:add returns (ok, err, forcible):
+--   err == "exists"    -> genuine duplicate, suppress (the point of this function)
+--   err == "no memory" -> the dict is FULL. Previously this returned false, i.e. the
+--                         event was silently skipped: not scored, not blocked, not
+--                         logged. Under load that is silent loss of enforcement.
+--                         We now fail toward EMITTING (duplicate telemetry is a far
+--                         better failure than an unscored tool call) and warn.
+--   forcible == true   -> an entry was LRU-evicted to make room; capacity is short.
+local dict_warned = 0
+local function first_time(sid, dkey, ttl, scope)
+  if scope == "none" then return true end
   local dict = ngx.shared.straiker_coding
-  if not dict then return true end
-  local ok = dict:add(sid .. ":" .. dkey, 1, ttl or 3600)
-  return ok and true or false
+  if not dict then
+    -- no dict declared: every event is re-scored on every call. Warn once per worker
+    -- rather than silently degrading (KONG_NGINX_HTTP_LUA_SHARED_DICT is required).
+    if dict_warned == 0 then
+      dict_warned = 1
+      kong.log.err(LOG, " shared dict 'straiker_coding' is NOT declared — dedup disabled, ",
+        "every event will be re-scored on every request. Set ",
+        "KONG_NGINX_HTTP_LUA_SHARED_DICT='straiker_coding 32m'")
+    end
+    return true
+  end
+  local ok, err, forcible = dict:add(sid .. ":" .. dkey, 1, ttl or 3600)
+  if ok then
+    if forcible then
+      local now = ngx.time()
+      if now - dict_warned > 60 then      -- rate-limit: this can fire per request
+        dict_warned = now
+        kong.log.warn(LOG, " dedup dict is evicting entries (capacity pressure); ",
+          "free=", dict:free_space(), " — consider raising straiker_coding size")
+      end
+    end
+    return true
+  end
+  if err == "exists" then return false end       -- genuine duplicate
+  -- anything else (notably "no memory"): emit rather than silently drop the event
+  kong.log.warn(LOG, " dedup dict add failed (", tostring(err), ") — emitting anyway to ",
+    "avoid silent loss of enforcement")
+  return true
 end
 
 local function evkey(e)
@@ -75,7 +111,16 @@ local function encode_event(e, ctx, conf)
   e.user_name = ctx.user_name
   e.session_id = ctx.session_id
   if conf.model_override then e.model = conf.model_override end
-  return cjson.encode(e)
+  -- cjson.safe returns nil (not a throw) on encode failure. Callers MUST nil-check:
+  -- a nil payload reaching detect.post() makes sign() do ts .. "." .. nil, which throws
+  -- OUTSIDE any pcall in the access phase and 500s the client — the exact opposite of
+  -- the documented fail-open contract.
+  local out, err = cjson.encode(e)
+  if not out then
+    kong.log.warn(LOG, " event encode failed (skipping event): ", tostring(err))
+    return nil
+  end
+  return out
 end
 
 -- fire-and-forget post (monitor, no log_serialize) via a timer — zero latency.
@@ -83,17 +128,25 @@ local function post_async(conf, event_json, label, sid)
   local ok = ngx.timer.at(0, function(premature)
     if premature then return end
     local res, err = detect.post(conf, event_json, false)
-    if conf.debug then
-      if res then
-        local turn = (res.body or ""):match('"turn_id"%s*:%s*"([^"]+)"') or "-"
-        kong.log.notice(LOG, " recon sid=", sid or "?", " event=", label,
-          " status=", res.status, " turn_id=", turn)
-      else
-        kong.log.warn(LOG, " ", label, " detect error: ", err or "?")
-      end
+    -- Failures are logged UNCONDITIONALLY. The recommended first-enable posture is
+    -- monitor + debug:false, under which a rotated key (401), a 400, a timeout or a DNS
+    -- failure previously produced NO log line at all — the Console simply went quiet
+    -- while the gateway looked healthy.
+    if not res then
+      kong.log.warn(LOG, " ", label, " detect FAILED sid=", sid or "?", " err=", err or "?")
+    elseif res.status and res.status >= 300 then
+      kong.log.warn(LOG, " ", label, " detect non-2xx sid=", sid or "?",
+        " status=", res.status, " body=", (res.body or ""):sub(1, 160))
+    elseif conf.debug then
+      local turn = (res.body or ""):match('"turn_id"%s*:%s*"([^"]+)"') or "-"
+      kong.log.notice(LOG, " recon sid=", sid or "?", " event=", label,
+        " status=", res.status, " turn_id=", turn)
     end
   end)
-  if not ok and conf.debug then kong.log.warn(LOG, " timer spawn failed") end
+  if not ok then
+    kong.log.err(LOG, " timer spawn FAILED for ", label, " sid=", sid or "?",
+      " — event dropped (lua_max_running_timers?)")
+  end
 end
 
 -- synchronous scoring (monitor + log): returns the full Straiker verdict so it
@@ -101,7 +154,14 @@ end
 -- response carries score/category/severity/action/turn_id.
 local function score_sync(conf, event_json)
   local res, err = detect.post(conf, event_json, false)
-  if not res then return { detect_error = err or "unreachable" } end
+  if not res then
+    kong.log.warn(LOG, " score_sync detect FAILED err=", err or "?")
+    return { detect_error = err or "unreachable" }
+  end
+  if res.status and res.status >= 300 then
+    kong.log.warn(LOG, " score_sync non-2xx status=", res.status,
+      " body=", (res.body or ""):sub(1, 160))
+  end
   local b = cjson.decode(res.body or "") or {}
   return { http = res.status, turn_id = b.turn_id, score = b.score,
            score_category = b.score_category, severity = b.severity,
@@ -185,6 +245,10 @@ end
 -- only reads hookSpecificOutput.permissionDecision, structurally cannot do.
 -- Returns (should_block, reason). Honors fail_open on a detect error.
 local function enforce_decision(conf, e, ej)
+  if type(ej) ~= "string" then
+    -- nothing to score; fail open (or closed if configured) rather than throwing
+    return (conf.fail_open == false), "Straiker guardrail could not encode the event."
+  end
   local verdict = score_sync(conf, ej)
   if conf.log_serialize then log_event(e, verdict, ej) end
   if verdict.detect_error then

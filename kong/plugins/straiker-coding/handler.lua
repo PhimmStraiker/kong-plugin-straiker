@@ -44,7 +44,11 @@ function StraikerCoding:access(conf)
 
   kong.ctx.plugin.sid = ctx.session_id
   kong.ctx.plugin.user = ctx.user_name
-  kong.ctx.plugin.streaming = raw:find('"stream"%s*:%s*true') ~= nil
+  -- Read the flag off the DECODED body. The old `raw:find('"stream"%s*:%s*true')` ran a
+  -- Lua-pattern scan over a ~140KB request on every call, and false-positived whenever a
+  -- user prompt merely contained the text "stream": true — flipping the block format to
+  -- SSE on a non-streaming request. preq.stream is parsed once, for free.
+  kong.ctx.plugin.streaming = (preq and preq.stream) == true
   if conf.log_serialize then core.serialize_request(conf, raw, ctx.session_id) end
 
   if conf.debug then
@@ -56,7 +60,7 @@ function StraikerCoding:access(conf)
   end
 
   for _, e in ipairs(events) do
-    if core.first_time(ctx.session_id, core.evkey(e), 3600) then
+    if core.first_time(ctx.session_id, core.evkey(e), conf.dedup_ttl_s or 3600, conf.dedup_scope) then
       local ej = core.encode_event(e, ctx, conf)
       local n = e.hook_event_name
       -- Request-side enforcement runs BEFORE the model is called:
@@ -129,7 +133,7 @@ function StraikerCoding:response(conf)
 
   for _, e in ipairs(events) do
     local n = e.hook_event_name
-    if (n == "PreToolUse" or n == "Stop") and core.first_time(sid, core.evkey(e), 3600) then
+    if (n == "PreToolUse" or n == "Stop") and core.first_time(sid, core.evkey(e), conf.dedup_ttl_s or 3600, conf.dedup_scope) then
       local ej = core.encode_event(e, ctx, conf)
       -- Stop is monitor-only: the answer already exists, so it is scored, never blocked.
       if conf.mode == "block" and n == "PreToolUse" then

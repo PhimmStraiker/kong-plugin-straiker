@@ -26,6 +26,18 @@ return {
               default = "https://api.prod.straiker.ai/api/v1/detect",
               custom_validator = not_webhook,
           } },
+          { agent = {
+              -- Which agent detector gates this route.
+              --   "auto" (default) — only process traffic that looks like Claude Code
+              --   "off"            — skip the detector and treat ALL traffic on this
+              --                      route as a coding agent. Required when the route is
+              --                      dedicated to one agent whose fingerprint differs
+              --                      (a custom harness, a restricted toolset).
+              -- Was read by the handler but never declared here, so it was always nil:
+              -- the only escape hatch for non-Claude-Code agents silently did nothing.
+              type = "string", default = "auto",
+              one_of = { "auto", "off" },
+          } },
           { x_tool = {
               type = "string", default = "claude-code",
           } },
@@ -85,6 +97,24 @@ return {
               -- Input gate behaviour when the detect call errors. Response-side
               -- enforcement always fails open (a real answer is never withheld).
               type = "boolean", default = true,
+          } },
+          { dedup_ttl_s = {
+              -- How long a synthesized event is remembered so the agentic loop's resent
+              -- transcript is not re-scored. Lower = less memory, more duplicates.
+              type = "integer", default = 3600,
+          } },
+          { dedup_scope = {
+              -- "node"  (default) — dedup state lives in this data plane's shared dict.
+              --   CONSTRAINT: state is per-node. With several data planes (App Runner
+              --   autoscaling, or a multi-node Kong), a session whose requests land on
+              --   different nodes re-emits its events per node. That is DUPLICATE
+              --   TELEMETRY, not a security gap — nothing goes unscored — but it inflates
+              --   Console turn counts. Mitigate with session affinity, or pin the service
+              --   to a single instance, until shared-state dedup exists.
+              -- "none"  — disable dedup entirely (every event scored on every request).
+              --   Useful only for debugging; very noisy.
+              type = "string", default = "node",
+              one_of = { "node", "none" },
           } },
           { timeout_ms = {
               type = "integer", default = 5000,

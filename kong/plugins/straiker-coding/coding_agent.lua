@@ -81,6 +81,34 @@ end
 
 -- From a message.content (string OR block array), return {texts=[...], is_string=bool}.
 -- texts excludes <system-reminder> blocks. For arrays, order is preserved.
+-- Describe non-text content blocks (images, documents) without carrying the payload.
+-- Claude Code puts attachments in the SAME content array as text — as
+-- {type="image", source={type="base64", media_type=..., data=...}} — and the text
+-- extractor ignores them, so an attachment was previously invisible to Straiker: a pasted
+-- image vanished, and reading an image produced an EMPTY tool_response. We record what
+-- was attached (kind, media type, approximate size) but deliberately not the bytes:
+-- base64 image data would balloon every detect payload for little scanning value.
+local function attachments_of(content)
+  if type(content) ~= "table" then return nil end
+  local out
+  for _, blk in ipairs(content) do
+    if type(blk) == "table" and (blk.type == "image" or blk.type == "document") then
+      local src = type(blk.source) == "table" and blk.source or {}
+      local n = type(src.data) == "string" and #src.data or 0
+      out = out or {}
+      out[#out + 1] = {
+        type = blk.type,
+        media_type = src.media_type,
+        source_type = src.type,                 -- "base64" | "url" | "file"
+        url = src.url,                          -- present for url sources; worth scanning
+        -- base64 inflates ~4/3; report the decoded size so operators see real bytes
+        bytes = n > 0 and math.floor(n * 3 / 4) or nil,
+      }
+    end
+  end
+  return out
+end
+
 local function texts_of(content)
   if type(content) == "string" then
     return { prompt_from_string(content) }, true
@@ -202,6 +230,9 @@ function M.parse_request(body, session_header)
           tool_use_id = blk.tool_use_id,
           name = blk.tool_use_id and res.call_names[blk.tool_use_id] or nil,
           content = ctext or "",
+          -- a tool can RETURN an attachment (Read on an image); without this the
+          -- tool_response is just "" and the Console shows nothing happened
+          attachments = attachments_of(blk.content),
           is_error = blk.is_error and true or false,
         }
       end
@@ -213,6 +244,7 @@ function M.parse_request(body, session_header)
   if last_user then
     local texts = texts_of(last_user.content)
     prompt = texts[#texts]
+    res.attachments = attachments_of(last_user.content)
   end
   res.user_prompt = prompt and trim(prompt) or nil
 
@@ -322,6 +354,7 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
       e.tool_name = tr.name or (ctx.tool_names and ctx.tool_names[tr.tool_use_id]) or nil
       e.tool_response = tr.content
       e.tool_use_id = tr.tool_use_id
+      if tr.attachments then e.attachments = tr.attachments end
       e.is_error = tr.is_error
       events[#events + 1] = e
     end
@@ -334,6 +367,7 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
       seen[dkey] = true
       local e = base("UserPromptSubmit")
       e.prompt = parsed_req.user_prompt
+      if parsed_req.attachments then e.attachments = parsed_req.attachments end
       events[#events + 1] = e
     end
   end

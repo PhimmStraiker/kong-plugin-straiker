@@ -164,18 +164,24 @@ function M.parse_request(body, session_header)
   -- tool_use block that a tool_result answers is always present in THIS request.
   -- Recovering it here is what lets PostToolUse carry a tool_name: the response-side
   -- map is built in a later phase and does not survive to the next request.
-  local call_names = {}
+  local call_names, prior_tool_uses = {}, {}
   for i = 1, #msgs do
     local m = msgs[i]
     if type(m) == "table" and m.role == "assistant" and type(m.content) == "table" then
       for _, blk in ipairs(m.content) do
         if type(blk) == "table" and blk.type == "tool_use" and blk.id then
           call_names[blk.id] = blk.name
+          -- Keep the full call so streaming mode can still emit PreToolUse telemetry
+          -- without buffering the response: the transcript is resent every turn, so the
+          -- assistant's tool calls are recoverable from the REQUEST. Post-hoc (the tool
+          -- has already run), so it is observability, not enforcement.
+          prior_tool_uses[#prior_tool_uses + 1] = { id = blk.id, name = blk.name, input = blk.input }
         end
       end
     end
   end
   res.call_names = call_names
+  res.prior_tool_uses = prior_tool_uses
 
   -- tool_results in the last user message → PostToolUse candidates
   if last_user and type(last_user.content) == "table" then
@@ -265,6 +271,23 @@ end
 -- ctx = { session_id, user_name, cwd, model, seen }  (seen = dedup state table)
 -- parsed_req from parse_request; parsed_resp from parse_response (may be nil).
 -- Returns a list of event tables (each ready to enrich + POST).
+-- Populate a PreToolUse event from a tool_use block. Shared by the response path
+-- (buffered mode) and the request-transcript path (streaming mode) so both emit
+-- byte-identical events.
+function M.fill_pre_tool_use(e, tu)
+  e.tool_name = tu.name
+  e.tool_input = hook_tool_input(tu.name, tu.input)
+  e.tool_use_id = tu.id
+  -- MCP passthrough. Claude Code names MCP tools mcp__<server>__<tool> (the server key
+  -- can itself contain single underscores; the delimiter is the double underscore).
+  if type(tu.name) == "string" and tu.name:match("^mcp__") then
+    local server, mtool = tu.name:match("^mcp__(.-)__(.+)$")
+    e.mcp_server_name = server or tu.name:match("^mcp__(.+)$")
+    e.mcp_tool_name = mtool
+  end
+  return e
+end
+
 function M.to_hook_events(parsed_req, parsed_resp, ctx)
   local events = {}
   local seen = ctx.seen or {}
@@ -315,17 +338,7 @@ function M.to_hook_events(parsed_req, parsed_resp, ctx)
       if tu.id and not seen[dkey] then
         seen[dkey] = true
         local e = base("PreToolUse")
-        e.tool_name = tu.name
-        e.tool_input = hook_tool_input(tu.name, tu.input)
-        e.tool_use_id = tu.id
-        -- MCP passthrough. Claude Code names MCP tools mcp__<server>__<tool>
-        -- (the server key can itself contain single underscores; the delimiter
-        -- is the double underscore). Split on "__" so multi-word servers work.
-        if type(tu.name) == "string" and tu.name:match("^mcp__") then
-          local server, mtool = tu.name:match("^mcp__(.-)__(.+)$")
-          e.mcp_server_name = server or tu.name:match("^mcp__(.+)$")
-          e.mcp_tool_name = mtool
-        end
+        M.fill_pre_tool_use(e, tu)
         events[#events + 1] = e
       end
     end

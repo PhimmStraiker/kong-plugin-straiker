@@ -55,7 +55,7 @@ step "3/5  golden regression (the real gate)"
 ok "$(tail -2 /tmp/promote_spec.log | head -1)"
 
 step "3a/5  behavioural QA (asserts each fix actually behaves)"
-"$REPO/lab-coding/parity/run_lua.sh" "$REPO/spec/qa.lua" >/tmp/promote_qa.log 2>&1 \
+( cd "$REPO" && eval "$(luarocks path)" && PLUGIN_REPO="$REPO" lua "$REPO/spec/qa.lua" ) >/tmp/promote_qa.log 2>&1 \
   || { grep -E "FAIL|QA RED" /tmp/promote_qa.log | head -15; fail "behavioural QA failed"; }
 ok "$(grep -oE "pass=[0-9]+ +fail=[0-9]+" /tmp/promote_qa.log | tail -1)"
 

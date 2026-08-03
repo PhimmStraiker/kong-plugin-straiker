@@ -54,6 +54,11 @@ step "3/5  golden regression (the real gate)"
 "$REPO/spec/run.sh" >/tmp/promote_spec.log 2>&1 || { tail -20 /tmp/promote_spec.log; fail "goldens differ — intended? re-bless, else fix"; }
 ok "$(tail -2 /tmp/promote_spec.log | head -1)"
 
+step "3a/5  behavioural QA (asserts each fix actually behaves)"
+"$REPO/lab-coding/parity/run_lua.sh" "$REPO/spec/qa.lua" >/tmp/promote_qa.log 2>&1 \
+  || { grep -E "FAIL|QA RED" /tmp/promote_qa.log | head -15; fail "behavioural QA failed"; }
+ok "$(grep -oE "pass=[0-9]+ +fail=[0-9]+" /tmp/promote_qa.log | tail -1)"
+
 step "3b/5  preflight: plugins enabled on the data plane"
 # Kong REJECTS an entire config batch containing a plugin that is not in KONG_PLUGINS,
 # and then silently keeps serving its last-good config. That looks exactly like a code
